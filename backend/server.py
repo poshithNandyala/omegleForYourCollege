@@ -6,24 +6,61 @@ import uuid
 import secrets
 import asyncio
 import logging
+import ipaddress
+import hashlib
+import json
+import re
 from datetime import datetime, timezone, timedelta
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 from contextlib import asynccontextmanager
 
 import bcrypt
 import jwt
 import resend
-from fastapi import FastAPI, HTTPException, Request, Response, Depends
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 import socketio
+from pymongo.errors import PyMongoError, ServerSelectionTimeoutError, DuplicateKeyError
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+DEFAULT_ADMIN_EMAIL = "admin@campuslink.com"
+DEFAULT_ADMIN_PASSWORD = "CampusLink@2024"
+LAN_ORIGIN_REGEX = (
+    r"^https?://("
+    r"localhost|127\.0\.0\.1|0\.0\.0\.0|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"192\.168\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}"
+    r")(:\d+)?$"
+)
+
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_csv_env(name: str, default: str = "") -> List[str]:
+    raw_value = os.environ.get(name, default)
+    return [item.strip().rstrip("/") for item in raw_value.split(",") if item.strip()]
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 # Configuration
+APP_ENV = os.environ.get("APP_ENV", "development").strip().lower()
 MONGO_URL = os.environ.get("MONGO_URL")
 DB_NAME = os.environ.get("DB_NAME", "campuslink")
 JWT_SECRET = os.environ.get("JWT_SECRET")
@@ -31,9 +68,99 @@ JWT_ALGORITHM = "HS256"
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 RESEND_FROM = os.environ.get("RESEND_FROM", "noreply@poshithcompany.in")
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY")
+TRUST_PROXY_HEADERS = parse_bool_env("TRUST_PROXY_HEADERS", False)
+ALLOW_LAN_ORIGINS = parse_bool_env("ALLOW_LAN_ORIGINS", True)
+ALLOW_WIFI_IDENTIFIER_OVERRIDE = parse_bool_env("ALLOW_WIFI_IDENTIFIER_OVERRIDE", False)
+COOKIE_SECURE = parse_bool_env("COOKIE_SECURE", APP_ENV != "development")
+COOKIE_SAMESITE = os.environ.get(
+    "COOKIE_SAMESITE",
+    "none" if COOKIE_SECURE else "lax"
+).strip().lower()
+COOKIE_DOMAIN = os.environ.get("COOKIE_DOMAIN")
+MATCH_PENDING_TTL_SECONDS = int(os.environ.get("MATCH_PENDING_TTL_SECONDS", "30"))
+MATCH_QUEUE_TTL_SECONDS = int(os.environ.get("MATCH_QUEUE_TTL_SECONDS", "90"))
+OTP_VERIFICATION_TTL_MINUTES = int(os.environ.get("OTP_VERIFICATION_TTL_MINUTES", "30"))
+OTP_RATE_LIMIT_WINDOW_MINUTES = int(os.environ.get("OTP_RATE_LIMIT_WINDOW_MINUTES", "10"))
+OTP_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("OTP_RATE_LIMIT_MAX_REQUESTS", "3"))
+MONGO_SERVER_SELECTION_TIMEOUT_MS = int(os.environ.get("MONGO_SERVER_SELECTION_TIMEOUT_MS", "5000"))
+MONGO_CONNECT_TIMEOUT_MS = int(os.environ.get("MONGO_CONNECT_TIMEOUT_MS", "5000"))
+MONGO_SOCKET_TIMEOUT_MS = int(os.environ.get("MONGO_SOCKET_TIMEOUT_MS", "5000"))
+REDIS_URL = os.environ.get("REDIS_URL")
+REDIS_NAMESPACE = os.environ.get("REDIS_NAMESPACE", "campuslink")
+REQUIRE_REDIS_IN_PRODUCTION = parse_bool_env("REQUIRE_REDIS_IN_PRODUCTION", True)
+REQUIRE_TURN_IN_PRODUCTION = parse_bool_env("REQUIRE_TURN_IN_PRODUCTION", True)
+STUN_URLS = parse_csv_env(
+    "STUN_URLS",
+    "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302"
+)
+TURN_URLS = parse_csv_env("TURN_URL")
+TURN_USERNAME = os.environ.get("TURN_USERNAME")
+TURN_CREDENTIAL = os.environ.get("TURN_CREDENTIAL")
+CORS_ORIGINS = parse_csv_env(
+    "CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8001,http://127.0.0.1:8001"
+)
 
 # Initialize Resend
 resend.api_key = RESEND_API_KEY
+
+if COOKIE_SAMESITE not in {"lax", "strict", "none"}:
+    raise RuntimeError("COOKIE_SAMESITE must be one of: lax, strict, none")
+
+if COOKIE_SAMESITE == "none" and not COOKIE_SECURE:
+    logger.warning("COOKIE_SAMESITE=none requires secure cookies. Falling back to lax.")
+    COOKIE_SAMESITE = "lax"
+
+AUTH_COOKIE_KWARGS = {
+    "httponly": True,
+    "secure": COOKIE_SECURE,
+    "samesite": COOKIE_SAMESITE,
+    "max_age": 7 * 24 * 60 * 60,
+    "path": "/",
+}
+
+REFRESH_COOKIE_KWARGS = {
+    "httponly": True,
+    "secure": COOKIE_SECURE,
+    "samesite": COOKIE_SAMESITE,
+    "max_age": 30 * 24 * 60 * 60,
+    "path": "/",
+}
+
+if COOKIE_DOMAIN:
+    AUTH_COOKIE_KWARGS["domain"] = COOKIE_DOMAIN
+    REFRESH_COOKIE_KWARGS["domain"] = COOKIE_DOMAIN
+
+TURN_ENABLED = bool(TURN_URLS and TURN_USERNAME and TURN_CREDENTIAL)
+
+RATE_LIMITS = {
+    "auth_send_otp": (3, OTP_RATE_LIMIT_WINDOW_MINUTES * 60),
+    "auth_login": (10, 15 * 60),
+    "profile_update": (10, 10 * 60),
+    "friend_add": (20, 10 * 60),
+    "match_find": (30, 60),
+    "match_cancel": (30, 60),
+    "report_create": (10, 60 * 60),
+    "block_create": (30, 60 * 60),
+    "socket_register": (10, 60),
+    "socket_offer": (20, 60),
+    "socket_answer": (20, 60),
+    "socket_ice": (300, 60),
+    "socket_chat": (40, 60),
+}
+
+PROFILE_CONTACT_PATTERNS = [
+    re.compile(r"\b\d{10}\b"),
+    re.compile(r"\b[\w\.-]+@[\w\.-]+\.\w{2,}\b"),
+    re.compile(r"(instagram|telegram|snapchat|whatsapp|discord)\s*[:@]?\s*\w+", re.IGNORECASE),
+]
+
+MODERATION_BLOCK_PATTERNS = [
+    re.compile(r"\b(kill yourself|kys|rape|nude pics|child porn|bomb threat)\b", re.IGNORECASE),
+    re.compile(r"\b(fuck|shit|bitch|asshole|bastard)\b", re.IGNORECASE),
+]
+
+REPORT_REASONS = {"harassment", "hate", "spam", "sexual_content", "violence", "impersonation", "other"}
 
 # Indian college email domains (comprehensive list)
 INDIAN_COLLEGE_DOMAINS = [
@@ -109,69 +236,662 @@ def get_college_from_email(email: str) -> str:
     return domain.replace(".", " ").title()
 
 # Pydantic Models
-class UserRegister(BaseModel):
+class APIModel(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+
+class UserRegister(APIModel):
     email: EmailStr
     password: str = Field(min_length=6)
     name: str = Field(min_length=2)
-    interests: List[str] = []
-    looking_for: List[str] = []  # networking, love, cofounder, study_buddy
+    interests: List[str] = Field(default_factory=list)
+    looking_for: List[Literal["networking", "love", "cofounder", "study_buddy"]] = Field(
+        default_factory=list
+    )
 
-class UserLogin(BaseModel):
+class UserLogin(APIModel):
     email: EmailStr
     password: str
 
-class OTPRequest(BaseModel):
+class OTPRequest(APIModel):
     email: EmailStr
 
-class OTPVerify(BaseModel):
+class OTPVerify(APIModel):
     email: EmailStr
-    otp: str
+    otp: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
 
-class UserUpdate(BaseModel):
-    name: Optional[str] = None
+class UserUpdate(APIModel):
+    name: Optional[str] = Field(default=None, min_length=2)
     interests: Optional[List[str]] = None
-    looking_for: Optional[List[str]] = None
-    bio: Optional[str] = None
+    looking_for: Optional[List[Literal["networking", "love", "cofounder", "study_buddy"]]] = None
+    bio: Optional[str] = Field(default=None, max_length=500)
 
-class ConnectRequest(BaseModel):
-    mode: str  # same_college, same_wifi, cross_college
-    wifi_identifier: Optional[str] = None
+class ConnectRequest(APIModel):
+    mode: Literal["same_college", "same_wifi", "cross_college"]
+    wifi_identifier: Optional[str] = Field(default=None, max_length=128)
+    network_fingerprint: Optional[str] = Field(default=None, max_length=128)
 
-class FriendRequest(BaseModel):
+class FriendRequest(APIModel):
     friend_user_id: str
 
-class AIMatchRequest(BaseModel):
-    purpose: str  # networking, love, cofounder, study_buddy
+class AIMatchRequest(APIModel):
+    purpose: Literal["networking", "love", "cofounder", "study_buddy"]
 
-class MessageSend(BaseModel):
+class MessageSend(APIModel):
     receiver_id: str
     content: str
+
+
+class BlockUserRequest(APIModel):
+    target_user_id: str
+    reason: Optional[str] = Field(default=None, max_length=200)
+
+
+class ReportUserRequest(APIModel):
+    reported_user_id: str
+    reason: Literal["harassment", "hate", "spam", "sexual_content", "violence", "impersonation", "other"]
+    details: Optional[str] = Field(default=None, max_length=1000)
+    call_id: Optional[str] = Field(default=None, max_length=64)
+    auto_block: bool = False
 
 # MongoDB client
 client = None
 db = None
+db_last_error: Optional[str] = None
+redis_client: Optional[Redis] = None
+redis_last_error: Optional[str] = None
+socket_manager = (
+    socketio.AsyncRedisManager(
+        REDIS_URL,
+        channel=f"{REDIS_NAMESPACE}:socketio",
+        write_only=False,
+        logger=logger,
+    )
+    if REDIS_URL
+    else None
+)
 
 # Socket.IO for real-time communication
 sio = socketio.AsyncServer(
     async_mode='asgi',
-    cors_allowed_origins="*",
+    client_manager=socket_manager,
+    cors_allowed_origins="*" if ALLOW_LAN_ORIGINS else CORS_ORIGINS,
     ping_timeout=60,
     ping_interval=25
 )
 
 # Matching queues
 matching_queues = {
-    "same_college": {},  # {college_id: [user_ids]}
-    "same_wifi": {},      # {wifi_id: [user_ids]}
-    "cross_college": []   # [user_ids]
+    "same_college": {},  # {college_id: [{user_id, queued_at}]}
+    "same_wifi": {},      # {wifi_id: [{user_id, queued_at}]}
+    "cross_college": []   # [{user_id, college, queued_at}]
 }
 
 # Active connections
-active_users = {}  # {user_id: sid}
-active_calls = {}  # {call_id: {user1_id, user2_id, status}}
+active_users = {}  # local-dev fallback only {user_id: sid}
+sid_user_map: Dict[str, str] = {}
+active_calls = {}  # local-dev fallback only
+pending_matches: Dict[str, Dict[str, Any]] = {}  # {user_id: {matched_user_id, call_id, mode, created_at, is_initiator}}
+matching_lock = asyncio.Lock()
+in_memory_rate_limits: Dict[str, List[float]] = {}
 
 async def get_db():
     return db
+
+
+def redis_key(*parts: str) -> str:
+    return ":".join([REDIS_NAMESPACE, *parts])
+
+
+def stable_key_fragment(value: Optional[str]) -> str:
+    if not value:
+        return "default"
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()
+
+
+def user_room(user_id: str) -> str:
+    return f"user:{user_id}"
+
+
+def queue_key_for(mode: str, bucket: Optional[str] = None) -> str:
+    if mode == "cross_college":
+        return redis_key("match", "queue", mode)
+    return redis_key("match", "queue", mode, stable_key_fragment(bucket))
+
+
+def user_queue_set_key(user_id: str) -> str:
+    return redis_key("match", "user-queues", user_id)
+
+
+def pending_match_key(user_id: str) -> str:
+    return redis_key("match", "pending", user_id)
+
+
+def online_users_key() -> str:
+    return redis_key("presence", "users")
+
+
+def online_user_counts_key() -> str:
+    return redis_key("presence", "counts")
+
+
+def turn_required() -> bool:
+    return APP_ENV == "production" and REQUIRE_TURN_IN_PRODUCTION
+
+
+def json_dumps(data: Dict[str, Any]) -> str:
+    return json.dumps(data, separators=(",", ":"), default=str)
+
+
+def json_loads(raw_value: Any) -> Dict[str, Any]:
+    if isinstance(raw_value, bytes):
+        raw_value = raw_value.decode("utf-8")
+    if isinstance(raw_value, str):
+        return json.loads(raw_value)
+    return raw_value
+
+
+async def ping_redis() -> bool:
+    global redis_last_error
+
+    if redis_client is None:
+        redis_last_error = "Redis client is not initialized."
+        return False
+
+    try:
+        await redis_client.ping()
+        redis_last_error = None
+        return True
+    except RedisError as exc:
+        redis_last_error = str(exc)
+        logger.error("Redis ping failed: %s", exc)
+        return False
+
+
+async def get_online_user_count() -> int:
+    if redis_client is None:
+        return len(active_users)
+
+    count = await redis_client.scard(online_users_key())
+    return int(count)
+
+
+async def mark_user_online(user_id: str) -> None:
+    if redis_client is None:
+        active_users[user_id] = user_id
+        return
+
+    await redis_client.hincrby(online_user_counts_key(), user_id, 1)
+    await redis_client.sadd(online_users_key(), user_id)
+
+
+async def mark_user_offline(user_id: str) -> None:
+    if redis_client is None:
+        active_users.pop(user_id, None)
+        return
+
+    remaining = await redis_client.hincrby(online_user_counts_key(), user_id, -1)
+    if remaining <= 0:
+        await redis_client.hdel(online_user_counts_key(), user_id)
+        await redis_client.srem(online_users_key(), user_id)
+
+
+def content_is_disallowed(text: Optional[str], *, field_name: str, forbid_contact: bool = False) -> Optional[str]:
+    if not text:
+        return None
+
+    normalized = " ".join(text.lower().split())
+    for pattern in MODERATION_BLOCK_PATTERNS:
+        if pattern.search(normalized):
+            return f"{field_name} contains language that is not allowed."
+
+    if forbid_contact:
+        for pattern in PROFILE_CONTACT_PATTERNS:
+            if pattern.search(text):
+                return f"{field_name} cannot contain contact details or social handles."
+
+    if len(normalized) >= 30 and len(set(normalized)) <= 4:
+        return f"{field_name} looks like spam."
+
+    return None
+
+
+async def record_moderation_incident(
+    user_id: str,
+    content: str,
+    reason: str,
+    field_name: str,
+) -> None:
+    if db is None:
+        return
+
+    await db.moderation_incidents.insert_one(
+        {
+            "incident_id": f"mod_{uuid.uuid4().hex[:12]}",
+            "user_id": user_id,
+            "field_name": field_name,
+            "reason": reason,
+            "content": content,
+            "created_at": utcnow(),
+        }
+    )
+
+
+async def enforce_text_policy(
+    user_id: str,
+    text: Optional[str],
+    *,
+    field_name: str,
+    forbid_contact: bool = False,
+) -> None:
+    issue = content_is_disallowed(text, field_name=field_name, forbid_contact=forbid_contact)
+    if issue:
+        await record_moderation_incident(user_id, text or "", issue, field_name)
+        raise HTTPException(status_code=400, detail=issue)
+
+
+async def are_users_blocked(user_id: str, other_user_id: str) -> bool:
+    if db is None:
+        return False
+
+    blocked = await db.blocks.find_one(
+        {
+            "$or": [
+                {"user_id": user_id, "blocked_user_id": other_user_id},
+                {"user_id": other_user_id, "blocked_user_id": user_id},
+            ]
+        },
+        {"_id": 1},
+    )
+    return blocked is not None
+
+
+async def enforce_not_blocked(user_id: str, other_user_id: str) -> None:
+    if await are_users_blocked(user_id, other_user_id):
+        raise HTTPException(status_code=403, detail="This interaction is unavailable due to a block.")
+
+
+async def decode_access_token_value(token: str) -> Dict[str, Any]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "access":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+
+        user = await db.users.find_one({"user_id": payload["sub"]}, {"_id": 0, "password_hash": 0})
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+
+        return user
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+async def increment_rate_limit(key: str, limit: int, window_seconds: int) -> int:
+    now_ts = utcnow().timestamp()
+
+    if redis_client is not None:
+        namespaced_key = redis_key("rate", key)
+        count = await redis_client.incr(namespaced_key)
+        if count == 1:
+            await redis_client.expire(namespaced_key, window_seconds)
+        return int(count)
+
+    attempts = in_memory_rate_limits.setdefault(key, [])
+    cutoff = now_ts - window_seconds
+    attempts[:] = [attempt for attempt in attempts if attempt >= cutoff]
+    attempts.append(now_ts)
+    return len(attempts)
+
+
+async def enforce_rate_limit(
+    key: str,
+    *,
+    limit_name: str,
+    override_message: Optional[str] = None,
+) -> None:
+    limit, window_seconds = RATE_LIMITS[limit_name]
+    current = await increment_rate_limit(key, limit, window_seconds)
+    if current > limit:
+        detail = override_message or "Too many requests. Please slow down."
+        raise HTTPException(status_code=429, detail=detail)
+
+
+async def socket_rate_limited(sid: str, key: str, limit_name: str, detail: str) -> bool:
+    limit, window_seconds = RATE_LIMITS[limit_name]
+    current = await increment_rate_limit(key, limit, window_seconds)
+    if current > limit:
+        await sio.emit("error", {"detail": detail}, to=sid)
+        return True
+    return False
+
+
+async def get_socket_user_id(sid: str) -> Optional[str]:
+    user_id = sid_user_map.get(sid)
+    if user_id:
+        return user_id
+
+    try:
+        session = await sio.get_session(sid)
+    except KeyError:
+        return None
+    return session.get("user_id")
+
+
+async def remove_user_from_queues(user_id: str) -> None:
+    if redis_client is None:
+        remove_user_from_queues_locked(user_id)
+        return
+
+    queue_keys = await redis_client.smembers(user_queue_set_key(user_id))
+    if not queue_keys:
+        return
+
+    pipeline = redis_client.pipeline()
+    for key in queue_keys:
+        decoded_key = key.decode("utf-8") if isinstance(key, bytes) else key
+        pipeline.zrem(decoded_key, user_id)
+    pipeline.delete(user_queue_set_key(user_id))
+    await pipeline.execute()
+
+
+async def prune_queue(queue_key: str) -> None:
+    if redis_client is None:
+        return
+    cutoff = utcnow().timestamp() - MATCH_QUEUE_TTL_SECONDS
+    await redis_client.zremrangebyscore(queue_key, "-inf", cutoff)
+
+
+async def enqueue_waiter_shared(queue_name: str, user_id: str, **metadata: Any) -> None:
+    if redis_client is None:
+        raise RuntimeError("enqueue_waiter_shared should not be used without Redis.")
+    await prune_queue(queue_name)
+    await redis_client.zadd(queue_name, {user_id: utcnow().timestamp()})
+    await redis_client.sadd(user_queue_set_key(user_id), queue_name)
+    await redis_client.expire(user_queue_set_key(user_id), MATCH_QUEUE_TTL_SECONDS)
+    if metadata:
+        await redis_client.set(
+            redis_key("match", "queue-meta", user_id),
+            json_dumps(metadata),
+            ex=MATCH_QUEUE_TTL_SECONDS,
+        )
+
+
+async def pop_next_waiter_shared(
+    queue_name: str,
+    current_user_id: str,
+    *,
+    current_college: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if redis_client is None:
+        raise RuntimeError("pop_next_waiter_shared should not be used without Redis.")
+
+    await prune_queue(queue_name)
+    candidate_ids = await redis_client.zrange(queue_name, 0, 50)
+    for raw_candidate in candidate_ids:
+        candidate_id = raw_candidate.decode("utf-8") if isinstance(raw_candidate, bytes) else raw_candidate
+        if candidate_id == current_user_id:
+            continue
+        if current_college:
+            candidate_user = await db.users.find_one({"user_id": candidate_id}, {"college": 1, "_id": 0})
+            if not candidate_user or candidate_user.get("college") == current_college:
+                continue
+
+        await redis_client.zrem(queue_name, candidate_id)
+        await redis_client.srem(user_queue_set_key(candidate_id), queue_name)
+        return {"user_id": candidate_id}
+    return None
+
+
+async def get_pending_match(user_id: str) -> Optional[Dict[str, Any]]:
+    if redis_client is None:
+        return pending_matches.pop(user_id, None)
+
+    raw_value = await redis_client.get(pending_match_key(user_id))
+    if raw_value is None:
+        return None
+
+    await redis_client.delete(pending_match_key(user_id))
+    return json_loads(raw_value)
+
+
+async def set_pending_match(user_id: str, data: Dict[str, Any]) -> None:
+    if redis_client is None:
+        pending_matches[user_id] = data
+        return
+
+    await redis_client.set(
+        pending_match_key(user_id),
+        json_dumps(data),
+        ex=MATCH_PENDING_TTL_SECONDS,
+    )
+
+
+async def discard_pending_match(user_id: str) -> Optional[Dict[str, Any]]:
+    if redis_client is None:
+        return discard_pending_match_locked(user_id)
+
+    current_key = pending_match_key(user_id)
+    raw_pending = await redis_client.get(current_key)
+    if raw_pending is None:
+        return None
+
+    pending = json_loads(raw_pending)
+    await redis_client.delete(current_key)
+
+    matched_user_id = pending.get("matched_user_id")
+    if matched_user_id:
+        other_key = pending_match_key(matched_user_id)
+        other_raw = await redis_client.get(other_key)
+        if other_raw is not None:
+            other_pending = json_loads(other_raw)
+            if other_pending.get("matched_user_id") == user_id:
+                await redis_client.delete(other_key)
+
+    return pending
+
+
+@asynccontextmanager
+async def acquire_match_lock():
+    if redis_client is None:
+        async with matching_lock:
+            yield
+        return
+
+    redis_lock = redis_client.lock(redis_key("match", "lock"), timeout=10, blocking_timeout=5)
+    acquired = await redis_lock.acquire()
+    if not acquired:
+        raise HTTPException(status_code=503, detail="Matching is temporarily busy. Please retry.")
+
+    try:
+        yield
+    finally:
+        try:
+            await redis_lock.release()
+        except RedisError:
+            logger.warning("Failed to release Redis match lock cleanly.")
+
+
+async def ping_database() -> bool:
+    global db_last_error
+
+    if client is None:
+        db_last_error = "Mongo client is not initialized."
+        return False
+
+    try:
+        await client.admin.command("ping")
+        db_last_error = None
+        return True
+    except PyMongoError as exc:
+        db_last_error = str(exc)
+        logger.error("MongoDB ping failed: %s", exc)
+        return False
+
+
+def validate_runtime_configuration() -> None:
+    missing = [name for name, value in [("MONGO_URL", MONGO_URL), ("JWT_SECRET", JWT_SECRET)] if not value]
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+    if APP_ENV == "production" and REQUIRE_REDIS_IN_PRODUCTION and not REDIS_URL:
+        raise RuntimeError("REDIS_URL is required in production.")
+
+    if turn_required() and not TURN_ENABLED:
+        raise RuntimeError("TURN_URL, TURN_USERNAME, and TURN_CREDENTIAL are required in production.")
+
+    if APP_ENV != "development" and len(JWT_SECRET) < 32:
+        logger.warning("JWT_SECRET should be at least 32 characters outside development.")
+
+    if not RESEND_API_KEY:
+        logger.warning("RESEND_API_KEY is not configured. OTP emails will fail.")
+
+    if not EMERGENT_LLM_KEY:
+        logger.warning("EMERGENT_LLM_KEY is not configured. AI features will fall back.")
+
+
+def set_auth_cookies(response: Response, access_token: str, refresh_token: str) -> None:
+    response.set_cookie(key="access_token", value=access_token, **AUTH_COOKIE_KWARGS)
+    response.set_cookie(key="refresh_token", value=refresh_token, **REFRESH_COOKIE_KWARGS)
+
+
+def clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(
+        "access_token",
+        path="/",
+        secure=COOKIE_SECURE,
+        httponly=True,
+        samesite=COOKIE_SAMESITE,
+        domain=COOKIE_DOMAIN,
+    )
+    response.delete_cookie(
+        "refresh_token",
+        path="/",
+        secure=COOKIE_SECURE,
+        httponly=True,
+        samesite=COOKIE_SAMESITE,
+        domain=COOKIE_DOMAIN,
+    )
+
+
+def get_request_ip(request: Request) -> str:
+    if TRUST_PROXY_HEADERS:
+        forwarded_for = request.headers.get("x-forwarded-for")
+        if forwarded_for:
+            return forwarded_for.split(",")[0].strip()
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "unknown"
+
+
+def derive_wifi_bucket(
+    request: Request,
+    wifi_identifier: Optional[str] = None,
+    network_fingerprint: Optional[str] = None,
+) -> str:
+    if ALLOW_WIFI_IDENTIFIER_OVERRIDE and wifi_identifier:
+        return f"custom:{wifi_identifier.strip().lower()}"
+
+    client_ip = get_request_ip(request)
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return f"ip:{client_ip}"
+
+    if isinstance(address, ipaddress.IPv4Address):
+        prefix = 24 if (address.is_private or address.is_loopback) else 32
+    else:
+        prefix = 64 if (address.is_private or address.is_link_local or address.is_loopback) else 128
+
+    network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
+    request_bucket = f"{network.network_address}/{network.prefixlen}"
+
+    if network_fingerprint:
+        return f"{request_bucket}:{network_fingerprint.strip().lower()}"
+
+    return request_bucket
+
+
+def build_ice_servers() -> List[Dict[str, Any]]:
+    ice_servers: List[Dict[str, Any]] = [{"urls": url} for url in STUN_URLS]
+    if TURN_ENABLED:
+        ice_servers.append(
+            {
+                "urls": TURN_URLS if len(TURN_URLS) > 1 else TURN_URLS[0],
+                "username": TURN_USERNAME,
+                "credential": TURN_CREDENTIAL,
+            }
+        )
+    return ice_servers
+
+
+def is_waiter_expired(waiter: Dict[str, Any]) -> bool:
+    return utcnow() - waiter["queued_at"] > timedelta(seconds=MATCH_QUEUE_TTL_SECONDS)
+
+
+def prune_waiters(queue: List[Dict[str, Any]]) -> None:
+    queue[:] = [waiter for waiter in queue if not is_waiter_expired(waiter)]
+
+
+def enqueue_waiter(queue: List[Dict[str, Any]], user_id: str, **metadata: Any) -> None:
+    prune_waiters(queue)
+    if any(waiter["user_id"] == user_id for waiter in queue):
+        return
+    queue.append({"user_id": user_id, "queued_at": utcnow(), **metadata})
+
+
+def pop_next_waiter(
+    queue: List[Dict[str, Any]],
+    current_user_id: str,
+    current_college: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    prune_waiters(queue)
+    for index, waiter in enumerate(queue):
+        if waiter["user_id"] == current_user_id:
+            continue
+        if current_college and waiter.get("college") == current_college:
+            continue
+        return queue.pop(index)
+    return None
+
+
+def remove_user_from_queues_locked(user_id: str) -> None:
+    for queue in matching_queues["same_college"].values():
+        queue[:] = [waiter for waiter in queue if waiter["user_id"] != user_id]
+
+    for queue in matching_queues["same_wifi"].values():
+        queue[:] = [waiter for waiter in queue if waiter["user_id"] != user_id]
+
+    matching_queues["cross_college"][:] = [
+        waiter for waiter in matching_queues["cross_college"] if waiter["user_id"] != user_id
+    ]
+
+
+def prune_pending_matches_locked() -> None:
+    now = utcnow()
+    expired_user_ids = [
+        user_id
+        for user_id, pending in pending_matches.items()
+        if now - pending["created_at"] > timedelta(seconds=MATCH_PENDING_TTL_SECONDS)
+    ]
+    for user_id in expired_user_ids:
+        pending_matches.pop(user_id, None)
+
+
+def discard_pending_match_locked(user_id: str) -> Optional[Dict[str, Any]]:
+    pending = pending_matches.pop(user_id, None)
+    if not pending:
+        return None
+
+    matched_user_id = pending.get("matched_user_id")
+    counterpart_pending = pending_matches.get(matched_user_id)
+    if counterpart_pending and counterpart_pending.get("matched_user_id") == user_id:
+        pending_matches.pop(matched_user_id, None)
+
+    return pending
 
 # Password functions
 def hash_password(password: str) -> str:
@@ -179,14 +899,19 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+    if not hashed_password:
+        return False
+    try:
+        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+    except ValueError:
+        return False
 
 # JWT functions
 def create_access_token(user_id: str, email: str) -> str:
     payload = {
         "sub": user_id,
         "email": email,
-        "exp": datetime.now(timezone.utc) + timedelta(days=7),
+        "exp": utcnow() + timedelta(days=7),
         "type": "access"
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -194,7 +919,7 @@ def create_access_token(user_id: str, email: str) -> str:
 def create_refresh_token(user_id: str) -> str:
     payload = {
         "sub": user_id,
-        "exp": datetime.now(timezone.utc) + timedelta(days=30),
+        "exp": utcnow() + timedelta(days=30),
         "type": "refresh"
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -209,52 +934,98 @@ async def get_current_user(request: Request) -> dict:
     
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-        if payload.get("type") != "access":
-            raise HTTPException(status_code=401, detail="Invalid token type")
-        
-        user = await db.users.find_one({"user_id": payload["sub"]}, {"_id": 0, "password_hash": 0})
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        
-        return user
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+
+    return await decode_access_token_value(token)
 
 # Lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, db
-    client = AsyncIOMotorClient(MONGO_URL)
+    global client, db, redis_client
+    validate_runtime_configuration()
+    client = AsyncIOMotorClient(
+        MONGO_URL,
+        serverSelectionTimeoutMS=MONGO_SERVER_SELECTION_TIMEOUT_MS,
+        connectTimeoutMS=MONGO_CONNECT_TIMEOUT_MS,
+        socketTimeoutMS=MONGO_SOCKET_TIMEOUT_MS,
+        retryWrites=True,
+    )
     db = client[DB_NAME]
+
+    db_reachable = await ping_database()
+    redis_reachable = True
+    if REDIS_URL:
+        redis_client = Redis.from_url(REDIS_URL, decode_responses=False)
+        redis_reachable = await ping_redis()
+    else:
+        redis_client = None
+
+    if not db_reachable:
+        logger.warning("Backend started without a healthy MongoDB connection.")
+    if REDIS_URL and not redis_reachable:
+        logger.warning("Backend started without a healthy Redis connection.")
+
+    if APP_ENV == "production":
+        if not db_reachable:
+            if redis_client is not None:
+                await redis_client.aclose()
+            client.close()
+            raise RuntimeError("MongoDB must be reachable before CampusLink starts in production.")
+        if REQUIRE_REDIS_IN_PRODUCTION and REDIS_URL and not redis_reachable:
+            if redis_client is not None:
+                await redis_client.aclose()
+            client.close()
+            raise RuntimeError("Redis must be reachable before CampusLink starts in production.")
     
     # Create indexes
-    await db.users.create_index("email", unique=True)
-    await db.users.create_index("user_id", unique=True)
-    await db.users.create_index("college")
-    await db.otp_tokens.create_index("expires_at", expireAfterSeconds=0)
-    await db.call_history.create_index("participants")
-    await db.call_history.create_index("created_at")
-    await db.friends.create_index([("user_id", 1), ("friend_id", 1)], unique=True)
-    await db.messages.create_index([("sender_id", 1), ("receiver_id", 1)])
-    await db.login_attempts.create_index("identifier")
-    
-    # Seed admin
-    await seed_admin()
+    if db_reachable:
+        await db.users.create_index("email", unique=True)
+        await db.users.create_index("user_id", unique=True)
+        await db.users.create_index("college")
+        await db.otp_tokens.create_index("expires_at", expireAfterSeconds=0)
+        await db.email_verifications.create_index("email", unique=True)
+        await db.email_verifications.create_index("expires_at", expireAfterSeconds=0)
+        await db.otp_rate_limits.create_index("created_at", expireAfterSeconds=OTP_RATE_LIMIT_WINDOW_MINUTES * 60)
+        await db.otp_rate_limits.create_index("identifier")
+        await db.call_history.create_index("participants")
+        await db.call_history.create_index("created_at")
+        await db.friends.create_index([("user_id", 1), ("friend_id", 1)], unique=True)
+        await db.blocks.create_index([("user_id", 1), ("blocked_user_id", 1)], unique=True)
+        await db.blocks.create_index("user_id")
+        await db.blocks.create_index("blocked_user_id")
+        await db.reports.create_index("report_id", unique=True)
+        await db.reports.create_index("reported_user_id")
+        await db.reports.create_index("reporter_user_id")
+        await db.moderation_incidents.create_index("incident_id", unique=True)
+        await db.moderation_incidents.create_index("user_id")
+        await db.messages.create_index([("sender_id", 1), ("receiver_id", 1)])
+        await db.login_attempts.create_index("identifier")
+        await db.login_attempts.create_index("last_attempt", expireAfterSeconds=24 * 60 * 60)
+
+        # Seed admin
+        await seed_admin()
     
     logger.info("CampusLink backend started")
     yield
     
+    if redis_client is not None:
+        await redis_client.aclose()
     client.close()
     logger.info("CampusLink backend stopped")
 
 async def seed_admin():
-    admin_email = os.environ.get("ADMIN_EMAIL", "admin@campuslink.com")
-    admin_password = os.environ.get("ADMIN_PASSWORD", "CampusLink@2024")
+    admin_email = os.environ.get("ADMIN_EMAIL", DEFAULT_ADMIN_EMAIL)
+    admin_password = os.environ.get(
+        "ADMIN_PASSWORD",
+        DEFAULT_ADMIN_PASSWORD if APP_ENV == "development" else "",
+    )
+
+    if not admin_email or not admin_password:
+        logger.info("Admin seeding skipped because ADMIN_EMAIL or ADMIN_PASSWORD is not set.")
+        return
+
+    if APP_ENV != "development" and admin_password == DEFAULT_ADMIN_PASSWORD:
+        logger.warning("Skipping admin seeding outside development because a default password was supplied.")
+        return
     
     existing = await db.users.find_one({"email": admin_email})
     if existing is None:
@@ -270,7 +1041,7 @@ async def seed_admin():
             "interests": [],
             "looking_for": [],
             "bio": "CampusLink Administrator",
-            "created_at": datetime.now(timezone.utc),
+            "created_at": utcnow(),
             "online": False
         })
         logger.info(f"Admin user created: {admin_email}")
@@ -284,14 +1055,37 @@ async def seed_admin():
 # FastAPI app
 app = FastAPI(title="CampusLink API", lifespan=lifespan)
 
+
+@app.exception_handler(ServerSelectionTimeoutError)
+async def mongo_timeout_exception_handler(request: Request, exc: ServerSelectionTimeoutError):
+    global db_last_error
+    db_last_error = str(exc)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Database is unavailable. Check MongoDB Atlas connectivity, TLS, and IP access list.",
+            "error_type": "database_unavailable",
+        },
+    )
+
+
+@app.exception_handler(PyMongoError)
+async def mongo_exception_handler(request: Request, exc: PyMongoError):
+    global db_last_error
+    db_last_error = str(exc)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "Database request failed. Check MongoDB configuration and connectivity.",
+            "error_type": "database_error",
+        },
+    )
+
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://yjyzhjf6-pnky.preview.emergentagent.com",
-        "http://localhost:8001"
-    ],
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=LAN_ORIGIN_REGEX if ALLOW_LAN_ORIGINS else None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -303,14 +1097,31 @@ socket_app = socketio.ASGIApp(sio, other_asgi_app=app)
 # ============ AUTH ENDPOINTS ============
 
 @app.post("/api/auth/send-otp")
-async def send_otp(request: OTPRequest):
+async def send_otp(payload: OTPRequest, request: Request):
     """Send OTP to college email for verification"""
-    email = request.email.lower()
+    email = payload.email.lower()
     
     if not is_valid_college_email(email):
         raise HTTPException(
             status_code=400, 
             detail="Please use a valid Indian college email address (.ac.in, .edu.in)"
+        )
+
+    if not RESEND_API_KEY:
+        raise HTTPException(status_code=503, detail="Email verification is not configured.")
+
+    now = utcnow()
+    rate_limit_identifier = f"{get_request_ip(request)}:{email}"
+    recent_requests = await db.otp_rate_limits.count_documents(
+        {
+            "identifier": rate_limit_identifier,
+            "created_at": {"$gte": now - timedelta(minutes=OTP_RATE_LIMIT_WINDOW_MINUTES)},
+        }
+    )
+    if recent_requests >= OTP_RATE_LIMIT_MAX_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many OTP requests. Try again in {OTP_RATE_LIMIT_WINDOW_MINUTES} minutes.",
         )
     
     # Generate 6-digit OTP
@@ -321,17 +1132,10 @@ async def send_otp(request: OTPRequest):
     await db.otp_tokens.insert_one({
         "email": email,
         "otp": otp,
-        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=10),
-        "created_at": datetime.now(timezone.utc)
+        "expires_at": now + timedelta(minutes=10),
+        "created_at": now
     })
-    
-    # Also store a dev bypass OTP (123456) for testing
-    await db.otp_tokens.insert_one({
-        "email": email,
-        "otp": "123456",
-        "expires_at": datetime.now(timezone.utc) + timedelta(hours=24),
-        "created_at": datetime.now(timezone.utc)
-    })
+    await db.otp_rate_limits.insert_one({"identifier": rate_limit_identifier, "created_at": now})
     
     # Send email via Resend
     html_content = f"""
@@ -347,7 +1151,7 @@ async def send_otp(request: OTPRequest):
                 <span style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #121212;">{otp}</span>
             </div>
             <p style="color: #4A4A4A; font-size: 14px; margin-top: 24px;">
-                This code expires in 10 minutes. (Dev: use 123456)
+                This code expires in 10 minutes.
             </p>
         </div>
     </div>
@@ -362,11 +1166,10 @@ async def send_otp(request: OTPRequest):
         }
         await asyncio.to_thread(resend.Emails.send, params)
         logger.info(f"OTP sent to {email}")
-        return {"status": "success", "message": "OTP sent to your email. Dev code: 123456"}
+        return {"status": "success", "message": "OTP sent to your email."}
     except Exception as e:
         logger.error(f"Failed to send OTP: {e}")
-        # Even if email fails, return success since we have dev bypass
-        return {"status": "success", "message": "OTP ready. Use code: 123456 for testing"}
+        raise HTTPException(status_code=500, detail="Failed to send OTP. Please try again later.")
 
 @app.post("/api/auth/verify-otp")
 async def verify_otp(request: OTPVerify):
@@ -381,11 +1184,22 @@ async def verify_otp(request: OTPVerify):
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     
-    if expires_at < datetime.now(timezone.utc):
+    if expires_at < utcnow():
         raise HTTPException(status_code=400, detail="OTP has expired")
     
     # Mark OTP as used
     await db.otp_tokens.delete_one({"_id": otp_doc["_id"]})
+    await db.email_verifications.update_one(
+        {"email": email},
+        {
+            "$set": {
+                "email": email,
+                "verified_at": utcnow(),
+                "expires_at": utcnow() + timedelta(minutes=OTP_VERIFICATION_TTL_MINUTES),
+            }
+        },
+        upsert=True,
+    )
     
     return {"status": "success", "message": "Email verified", "email": email}
 
@@ -404,6 +1218,17 @@ async def register(data: UserRegister, response: Response):
     existing = await db.users.find_one({"email": email})
     if existing:
         raise HTTPException(status_code=400, detail="Email already registered")
+
+    verification = await db.email_verifications.find_one({"email": email})
+    if not verification:
+        raise HTTPException(status_code=400, detail="Email verification is required before signup")
+
+    verification_expires_at = verification["expires_at"]
+    if verification_expires_at.tzinfo is None:
+        verification_expires_at = verification_expires_at.replace(tzinfo=timezone.utc)
+    if verification_expires_at < utcnow():
+        await db.email_verifications.delete_one({"email": email})
+        raise HTTPException(status_code=400, detail="Email verification has expired. Verify again.")
     
     user_id = f"user_{uuid.uuid4().hex[:12]}"
     college = get_college_from_email(email)
@@ -420,26 +1245,18 @@ async def register(data: UserRegister, response: Response):
         "bio": "",
         "friends": [],
         "online": False,
-        "last_seen": datetime.now(timezone.utc),
-        "created_at": datetime.now(timezone.utc)
+        "last_seen": utcnow(),
+        "created_at": utcnow()
     }
     
     await db.users.insert_one(user_doc)
+    await db.email_verifications.delete_one({"email": email})
     
     # Create tokens
     access_token = create_access_token(user_id, email)
     refresh_token = create_refresh_token(user_id)
-    
-    response.set_cookie(
-        key="access_token", value=access_token,
-        httponly=True, secure=True, samesite="none",
-        max_age=7*24*60*60, path="/"
-    )
-    response.set_cookie(
-        key="refresh_token", value=refresh_token,
-        httponly=True, secure=True, samesite="none",
-        max_age=30*24*60*60, path="/"
-    )
+
+    set_auth_cookies(response, access_token, refresh_token)
     
     user_doc.pop("password_hash")
     user_doc.pop("_id", None)
@@ -456,7 +1273,7 @@ async def login(data: UserLogin, request: Request, response: Response):
     email = data.email.lower()
     
     # Brute force check
-    ip = request.client.host if request.client else "unknown"
+    ip = get_request_ip(request)
     identifier = f"{ip}:{email}"
     
     attempts_doc = await db.login_attempts.find_one({"identifier": identifier})
@@ -465,7 +1282,7 @@ async def login(data: UserLogin, request: Request, response: Response):
             locked_until = attempts_doc["locked_until"]
             if locked_until.tzinfo is None:
                 locked_until = locked_until.replace(tzinfo=timezone.utc)
-            if locked_until > datetime.now(timezone.utc):
+            if locked_until > utcnow():
                 raise HTTPException(
                     status_code=429,
                     detail="Too many failed attempts. Try again in 15 minutes."
@@ -478,8 +1295,8 @@ async def login(data: UserLogin, request: Request, response: Response):
             {"identifier": identifier},
             {
                 "$inc": {"attempts": 1},
-                "$set": {"last_attempt": datetime.now(timezone.utc)},
-                "$setOnInsert": {"created_at": datetime.now(timezone.utc)}
+                "$set": {"last_attempt": utcnow()},
+                "$setOnInsert": {"created_at": utcnow()}
             },
             upsert=True
         )
@@ -489,7 +1306,7 @@ async def login(data: UserLogin, request: Request, response: Response):
         if updated and updated.get("attempts", 0) >= 5:
             await db.login_attempts.update_one(
                 {"identifier": identifier},
-                {"$set": {"locked_until": datetime.now(timezone.utc) + timedelta(minutes=15)}}
+                {"$set": {"locked_until": utcnow() + timedelta(minutes=15)}}
             )
         
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -500,17 +1317,8 @@ async def login(data: UserLogin, request: Request, response: Response):
     user_id = user["user_id"]
     access_token = create_access_token(user_id, email)
     refresh_token = create_refresh_token(user_id)
-    
-    response.set_cookie(
-        key="access_token", value=access_token,
-        httponly=True, secure=True, samesite="none",
-        max_age=7*24*60*60, path="/"
-    )
-    response.set_cookie(
-        key="refresh_token", value=refresh_token,
-        httponly=True, secure=True, samesite="none",
-        max_age=30*24*60*60, path="/"
-    )
+
+    set_auth_cookies(response, access_token, refresh_token)
     
     user.pop("password_hash", None)
     user.pop("_id", None)
@@ -530,8 +1338,7 @@ async def get_me(request: Request):
 @app.post("/api/auth/logout")
 async def logout(response: Response):
     """Logout user"""
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/")
+    clear_auth_cookies(response)
     return {"status": "success", "message": "Logged out"}
 
 @app.get("/api/auth/google")
@@ -551,7 +1358,7 @@ async def google_callback(request: Request, response: Response):
     
     try:
         import httpx
-        async with httpx.AsyncClient() as client_http:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client_http:
             resp = await client_http.get(
                 "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
                 headers={"X-Session-ID": session_id}
@@ -593,8 +1400,8 @@ async def google_callback(request: Request, response: Response):
             "bio": "",
             "friends": [],
             "online": False,
-            "last_seen": datetime.now(timezone.utc),
-            "created_at": datetime.now(timezone.utc),
+            "last_seen": utcnow(),
+            "created_at": utcnow(),
             "auth_provider": "google"
         }
         
@@ -606,17 +1413,8 @@ async def google_callback(request: Request, response: Response):
     # Create tokens
     access_token = create_access_token(user["user_id"], email)
     refresh_token = create_refresh_token(user["user_id"])
-    
-    response.set_cookie(
-        key="access_token", value=access_token,
-        httponly=True, secure=True, samesite="none",
-        max_age=7*24*60*60, path="/"
-    )
-    response.set_cookie(
-        key="refresh_token", value=refresh_token,
-        httponly=True, secure=True, samesite="none",
-        max_age=30*24*60*60, path="/"
-    )
+
+    set_auth_cookies(response, access_token, refresh_token)
     
     user.pop("password_hash", None)
     user.pop("_id", None)
@@ -639,15 +1437,27 @@ async def get_profile(request: Request):
 async def update_profile(data: UserUpdate, request: Request):
     """Update user profile"""
     user = await get_current_user(request)
+    await enforce_rate_limit(
+        f"profile-update:{user['user_id']}",
+        limit_name="profile_update",
+        override_message="Too many profile updates. Try again later.",
+    )
     
     update_data = {}
     if data.name:
+        await enforce_text_policy(user["user_id"], data.name, field_name="Name")
         update_data["name"] = data.name
     if data.interests is not None:
         update_data["interests"] = data.interests
     if data.looking_for is not None:
         update_data["looking_for"] = data.looking_for
     if data.bio is not None:
+        await enforce_text_policy(
+            user["user_id"],
+            data.bio,
+            field_name="Bio",
+            forbid_contact=True,
+        )
         update_data["bio"] = data.bio
     
     if update_data:
@@ -662,7 +1472,8 @@ async def update_profile(data: UserUpdate, request: Request):
 @app.get("/api/users/{user_id}")
 async def get_user(user_id: str, request: Request):
     """Get another user's public profile"""
-    await get_current_user(request)  # Ensure authenticated
+    current_user = await get_current_user(request)
+    await enforce_not_blocked(current_user["user_id"], user_id)
     
     user = await db.users.find_one(
         {"user_id": user_id},
@@ -679,9 +1490,16 @@ async def get_user(user_id: str, request: Request):
 async def add_friend(data: FriendRequest, request: Request):
     """Add a user as friend"""
     user = await get_current_user(request)
+    await enforce_rate_limit(
+        f"friend-add:{user['user_id']}",
+        limit_name="friend_add",
+        override_message="Too many friend requests. Please slow down.",
+    )
     
     if user["user_id"] == data.friend_user_id:
         raise HTTPException(status_code=400, detail="Cannot add yourself as friend")
+
+    await enforce_not_blocked(user["user_id"], data.friend_user_id)
     
     friend = await db.users.find_one({"user_id": data.friend_user_id})
     if not friend:
@@ -699,12 +1517,12 @@ async def add_friend(data: FriendRequest, request: Request):
     await db.friends.insert_one({
         "user_id": user["user_id"],
         "friend_id": data.friend_user_id,
-        "created_at": datetime.now(timezone.utc)
+        "created_at": utcnow()
     })
     await db.friends.insert_one({
         "user_id": data.friend_user_id,
         "friend_id": user["user_id"],
-        "created_at": datetime.now(timezone.utc)
+        "created_at": utcnow()
     })
     
     return {"status": "success", "message": "Friend added"}
@@ -742,6 +1560,112 @@ async def get_friends(request: Request):
     
     return {"friends": friends}
 
+
+# ============ SAFETY ENDPOINTS ============
+
+@app.get("/api/safety/blocks")
+async def get_blocked_users(request: Request):
+    user = await get_current_user(request)
+
+    blocks = await db.blocks.find({"user_id": user["user_id"]}, {"_id": 0}).to_list(200)
+    blocked_ids = [block["blocked_user_id"] for block in blocks]
+    blocked_users = await db.users.find(
+        {"user_id": {"$in": blocked_ids}},
+        {"_id": 0, "password_hash": 0, "email": 0},
+    ).to_list(200)
+
+    return {"blocked_users": blocked_users}
+
+
+@app.post("/api/safety/block")
+async def block_user(data: BlockUserRequest, request: Request):
+    user = await get_current_user(request)
+    await enforce_rate_limit(
+        f"block:{user['user_id']}",
+        limit_name="block_create",
+        override_message="Too many block actions. Try again later.",
+    )
+
+    if user["user_id"] == data.target_user_id:
+        raise HTTPException(status_code=400, detail="You cannot block yourself.")
+
+    target_user = await db.users.find_one({"user_id": data.target_user_id}, {"_id": 0, "user_id": 1})
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        await db.blocks.insert_one(
+            {
+                "block_id": f"block_{uuid.uuid4().hex[:12]}",
+                "user_id": user["user_id"],
+                "blocked_user_id": data.target_user_id,
+                "reason": data.reason or "",
+                "created_at": utcnow(),
+            }
+        )
+    except DuplicateKeyError:
+        return {"status": "success", "message": "User already blocked"}
+
+    async with acquire_match_lock():
+        await remove_user_from_queues(user["user_id"])
+        await remove_user_from_queues(data.target_user_id)
+        await discard_pending_match(user["user_id"])
+        await discard_pending_match(data.target_user_id)
+
+    return {"status": "success", "message": "User blocked"}
+
+
+@app.delete("/api/safety/block/{target_user_id}")
+async def unblock_user(target_user_id: str, request: Request):
+    user = await get_current_user(request)
+    await db.blocks.delete_one({"user_id": user["user_id"], "blocked_user_id": target_user_id})
+    return {"status": "success", "message": "User unblocked"}
+
+
+@app.post("/api/safety/report")
+async def report_user(data: ReportUserRequest, request: Request):
+    user = await get_current_user(request)
+    await enforce_rate_limit(
+        f"report:{user['user_id']}",
+        limit_name="report_create",
+        override_message="Too many reports. Please try again later.",
+    )
+
+    if user["user_id"] == data.reported_user_id:
+        raise HTTPException(status_code=400, detail="You cannot report yourself.")
+
+    reported_user = await db.users.find_one({"user_id": data.reported_user_id}, {"_id": 0, "user_id": 1})
+    if not reported_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    await db.reports.insert_one(
+        {
+            "report_id": f"report_{uuid.uuid4().hex[:12]}",
+            "reporter_user_id": user["user_id"],
+            "reported_user_id": data.reported_user_id,
+            "reason": data.reason,
+            "details": data.details or "",
+            "call_id": data.call_id,
+            "created_at": utcnow(),
+        }
+    )
+
+    if data.auto_block:
+        try:
+            await db.blocks.insert_one(
+                {
+                    "block_id": f"block_{uuid.uuid4().hex[:12]}",
+                    "user_id": user["user_id"],
+                    "blocked_user_id": data.reported_user_id,
+                    "reason": f"Auto-block after report: {data.reason}",
+                    "created_at": utcnow(),
+                }
+            )
+        except DuplicateKeyError:
+            pass
+
+    return {"status": "success", "message": "Report submitted"}
+
 # ============ CALL HISTORY ENDPOINTS ============
 
 @app.get("/api/calls/history")
@@ -771,92 +1695,161 @@ async def get_call_history(request: Request):
 async def find_match(data: ConnectRequest, request: Request):
     """Find a match based on connection mode"""
     user = await get_current_user(request)
+    await enforce_rate_limit(
+        f"match-find:{user['user_id']}",
+        limit_name="match_find",
+        override_message="Too many match attempts. Please wait a moment.",
+    )
+
+    if turn_required() and not TURN_ENABLED:
+        raise HTTPException(status_code=503, detail="TURN relay is required before matching is available in production.")
+
     user_id = user["user_id"]
     college = user.get("college", "")
-    
-    match_id = None
-    
-    if data.mode == "same_college":
-        # Match within same college
-        if college not in matching_queues["same_college"]:
-            matching_queues["same_college"][college] = []
-        
-        queue = matching_queues["same_college"][college]
-        if queue and queue[0] != user_id:
-            match_id = queue.pop(0)
+    current_match: Optional[Dict[str, Any]] = None
+
+    async with acquire_match_lock():
+        pending = await get_pending_match(user_id)
+        if pending:
+            current_match = pending
         else:
-            if user_id not in queue:
-                queue.append(user_id)
-    
-    elif data.mode == "same_wifi":
-        wifi_id = data.wifi_identifier or "default"
-        if wifi_id not in matching_queues["same_wifi"]:
-            matching_queues["same_wifi"][wifi_id] = []
-        
-        queue = matching_queues["same_wifi"][wifi_id]
-        if queue and queue[0] != user_id:
-            match_id = queue.pop(0)
-        else:
-            if user_id not in queue:
-                queue.append(user_id)
-    
-    elif data.mode == "cross_college":
-        queue = matching_queues["cross_college"]
-        # Find someone from different college
-        for i, uid in enumerate(queue):
-            if uid != user_id:
-                other_user = await db.users.find_one({"user_id": uid})
-                if other_user and other_user.get("college") != college:
-                    match_id = queue.pop(i)
+            await remove_user_from_queues(user_id)
+
+            network_bucket: Optional[str] = None
+            matched_waiter: Optional[Dict[str, Any]] = None
+            queue_name: Optional[str] = None
+
+            if data.mode == "same_college":
+                queue_name = queue_key_for("same_college", college)
+            elif data.mode == "same_wifi":
+                network_bucket = derive_wifi_bucket(
+                    request,
+                    data.wifi_identifier,
+                    data.network_fingerprint,
+                )
+                queue_name = queue_key_for("same_wifi", network_bucket)
+            else:
+                queue_name = queue_key_for("cross_college")
+
+            while True:
+                if redis_client is not None:
+                    if data.mode == "cross_college":
+                        matched_waiter = await pop_next_waiter_shared(
+                            queue_name,
+                            user_id,
+                            current_college=college,
+                        )
+                    else:
+                        matched_waiter = await pop_next_waiter_shared(queue_name, user_id)
+                else:
+                    if data.mode == "same_college":
+                        queue = matching_queues["same_college"].setdefault(college, [])
+                        matched_waiter = pop_next_waiter(queue, user_id)
+                    elif data.mode == "same_wifi":
+                        queue = matching_queues["same_wifi"].setdefault(network_bucket, [])
+                        matched_waiter = pop_next_waiter(queue, user_id)
+                    else:
+                        queue = matching_queues["cross_college"]
+                        matched_waiter = pop_next_waiter(queue, user_id, current_college=college)
+
+                if not matched_waiter:
                     break
-        
-        if not match_id and user_id not in queue:
-            queue.append(user_id)
-    
-    if match_id:
-        # Create call record
-        call_id = f"call_{uuid.uuid4().hex[:12]}"
-        call_doc = {
-            "call_id": call_id,
-            "participants": [user_id, match_id],
-            "mode": data.mode,
-            "status": "matched",
-            "created_at": datetime.now(timezone.utc)
-        }
-        await db.call_history.insert_one(call_doc)
-        
-        # Get matched user info
-        matched_user = await db.users.find_one(
-            {"user_id": match_id},
-            {"_id": 0, "password_hash": 0, "email": 0}
-        )
-        
-        return {
-            "status": "matched",
-            "call_id": call_id,
-            "matched_user": matched_user
-        }
-    
-    return {"status": "waiting", "message": "Looking for a match..."}
+                if await are_users_blocked(user_id, matched_waiter["user_id"]):
+                    matched_waiter = None
+                    continue
+                break
+
+            if not matched_waiter:
+                if redis_client is not None:
+                    metadata = {"college": college} if data.mode == "cross_college" else {}
+                    await enqueue_waiter_shared(queue_name, user_id, **metadata)
+                elif data.mode == "same_college":
+                    queue = matching_queues["same_college"].setdefault(college, [])
+                    enqueue_waiter(queue, user_id)
+                elif data.mode == "same_wifi":
+                    queue = matching_queues["same_wifi"].setdefault(network_bucket, [])
+                    enqueue_waiter(queue, user_id)
+                else:
+                    queue = matching_queues["cross_college"]
+                    enqueue_waiter(queue, user_id, college=college)
+
+            if matched_waiter:
+                call_id = f"call_{uuid.uuid4().hex[:12]}"
+                await db.call_history.insert_one(
+                    {
+                        "call_id": call_id,
+                        "participants": [user_id, matched_waiter["user_id"]],
+                        "mode": data.mode,
+                        "status": "matched",
+                        "same_wifi_bucket": network_bucket,
+                        "created_at": utcnow(),
+                    }
+                )
+
+                await set_pending_match(
+                    matched_waiter["user_id"],
+                    {
+                        "matched_user_id": user_id,
+                        "call_id": call_id,
+                        "mode": data.mode,
+                        "is_initiator": False,
+                        "created_at": utcnow().isoformat(),
+                    },
+                )
+
+                current_match = {
+                    "matched_user_id": matched_waiter["user_id"],
+                    "call_id": call_id,
+                    "mode": data.mode,
+                    "is_initiator": True,
+                    "created_at": utcnow().isoformat(),
+                }
+
+    if not current_match:
+        return {"status": "waiting", "message": "Looking for a match..."}
+
+    matched_user = await db.users.find_one(
+        {"user_id": current_match["matched_user_id"]},
+        {"_id": 0, "password_hash": 0, "email": 0},
+    )
+    if not matched_user:
+        async with acquire_match_lock():
+            await discard_pending_match(current_match["matched_user_id"])
+        raise HTTPException(status_code=404, detail="Matched user is no longer available")
+
+    await enforce_not_blocked(user_id, matched_user["user_id"])
+
+    return {
+        "status": "matched",
+        "call_id": current_match["call_id"],
+        "matched_user": matched_user,
+        "is_initiator": current_match["is_initiator"],
+    }
 
 @app.post("/api/match/cancel")
 async def cancel_match(request: Request):
     """Cancel matching and remove from queues"""
     user = await get_current_user(request)
+    await enforce_rate_limit(
+        f"match-cancel:{user['user_id']}",
+        limit_name="match_cancel",
+        override_message="Too many cancel requests. Please wait a moment.",
+    )
     user_id = user["user_id"]
-    
-    # Remove from all queues
-    for college, queue in matching_queues["same_college"].items():
-        if user_id in queue:
-            queue.remove(user_id)
-    
-    for wifi, queue in matching_queues["same_wifi"].items():
-        if user_id in queue:
-            queue.remove(user_id)
-    
-    if user_id in matching_queues["cross_college"]:
-        matching_queues["cross_college"].remove(user_id)
-    
+    cancelled_call_id = None
+
+    async with acquire_match_lock():
+        await remove_user_from_queues(user_id)
+        pending = await discard_pending_match(user_id)
+        if pending:
+            cancelled_call_id = pending.get("call_id")
+
+    if cancelled_call_id:
+        await db.call_history.update_one(
+            {"call_id": cancelled_call_id},
+            {"$set": {"status": "cancelled_before_connect", "ended_at": utcnow()}},
+        )
+
     return {"status": "success", "message": "Matching cancelled"}
 
 # ============ AI MATCHING ENDPOINTS ============
@@ -865,11 +1858,24 @@ async def cancel_match(request: Request):
 async def ai_suggest_match(data: AIMatchRequest, request: Request):
     """Get AI-powered match suggestions"""
     user = await get_current_user(request)
+    blocks = await db.blocks.find(
+        {
+            "$or": [
+                {"user_id": user["user_id"]},
+                {"blocked_user_id": user["user_id"]},
+            ]
+        },
+        {"_id": 0, "user_id": 1, "blocked_user_id": 1},
+    ).to_list(500)
+    blocked_ids = {
+        block["blocked_user_id"] if block["user_id"] == user["user_id"] else block["user_id"]
+        for block in blocks
+    }
     
     # Get potential matches from same college or cross-college
     potential_users = await db.users.find(
         {
-            "user_id": {"$ne": user["user_id"]},
+            "user_id": {"$ne": user["user_id"], "$nin": list(blocked_ids)},
             "looking_for": data.purpose
         },
         {"_id": 0, "password_hash": 0, "email": 0}
@@ -937,6 +1943,7 @@ async def get_ice_breaker(request: Request):
     )
     if not other_user:
         raise HTTPException(status_code=404, detail="User not found")
+    await enforce_not_blocked(user["user_id"], other_user_id)
     
     try:
         from emergentintegrations.llm.chat import LlmChat, UserMessage
@@ -988,7 +1995,7 @@ async def create_study_session(request: Request):
         "solutions": [],
         "chat_messages": [],
         "status": "active",
-        "created_at": datetime.now(timezone.utc)
+        "created_at": utcnow()
     }
     
     await db.study_sessions.insert_one(session_doc)
@@ -1022,7 +2029,7 @@ async def submit_solution(session_id: str, request: Request):
     solution = {
         "user_id": user["user_id"],
         "content": body.get("content", ""),
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "created_at": utcnow().isoformat()
     }
     
     await db.study_sessions.update_one(
@@ -1041,80 +2048,149 @@ async def connect(sid, environ):
 @sio.event
 async def disconnect(sid):
     logger.info(f"Client disconnected: {sid}")
-    # Remove from active users
-    user_id = None
-    for uid, s in list(active_users.items()):
-        if s == sid:
-            user_id = uid
-            del active_users[uid]
-            break
+    user_id = sid_user_map.pop(sid, None)
+    if not user_id:
+        user_id = await get_socket_user_id(sid)
     
     if user_id:
-        # Update user online status
+        cancelled_call_id = None
+        await mark_user_offline(user_id)
+
+        still_online = False
+        if redis_client is not None:
+            still_online = bool(await redis_client.sismember(online_users_key(), user_id))
+        else:
+            still_online = user_id in active_users
+
         await db.users.update_one(
             {"user_id": user_id},
-            {"$set": {"online": False, "last_seen": datetime.now(timezone.utc)}}
+            {"$set": {"online": still_online, "last_seen": utcnow()}}
         )
-        
-        # Remove from matching queues
-        for college, queue in matching_queues["same_college"].items():
-            if user_id in queue:
-                queue.remove(user_id)
-        
-        for wifi, queue in matching_queues["same_wifi"].items():
-            if user_id in queue:
-                queue.remove(user_id)
-        
-        if user_id in matching_queues["cross_college"]:
-            matching_queues["cross_college"].remove(user_id)
+
+        async with acquire_match_lock():
+            await remove_user_from_queues(user_id)
+            pending = await discard_pending_match(user_id)
+            if pending:
+                cancelled_call_id = pending.get("call_id")
+
+        if cancelled_call_id:
+            await db.call_history.update_one(
+                {"call_id": cancelled_call_id},
+                {"$set": {"status": "cancelled_before_connect", "ended_at": utcnow()}},
+            )
 
 @sio.event
 async def register_user(sid, data):
     """Register user socket connection"""
-    user_id = data.get("user_id")
-    if user_id:
-        active_users[user_id] = sid
-        await db.users.update_one(
-            {"user_id": user_id},
-            {"$set": {"online": True}}
-        )
-        await sio.emit("registered", {"status": "ok"}, to=sid)
+    access_token = data.get("access_token")
+    claimed_user_id = data.get("user_id")
+
+    if await socket_rate_limited(sid, f"socket-register:{sid}", "socket_register", "Too many socket registrations."):
+        return
+
+    if not access_token:
+        await sio.emit("error", {"detail": "Socket authentication token is required."}, to=sid)
+        await sio.disconnect(sid)
+        return
+
+    try:
+        user = await decode_access_token_value(access_token)
+    except HTTPException as exc:
+        await sio.emit("error", {"detail": exc.detail}, to=sid)
+        await sio.disconnect(sid)
+        return
+
+    user_id = user["user_id"]
+    if claimed_user_id and claimed_user_id != user_id:
+        await sio.emit("error", {"detail": "Socket user mismatch."}, to=sid)
+        await sio.disconnect(sid)
+        return
+
+    sid_user_map[sid] = user_id
+    await sio.save_session(sid, {"user_id": user_id})
+    await sio.enter_room(sid, user_room(user_id))
+    await mark_user_online(user_id)
+    await db.users.update_one(
+        {"user_id": user_id},
+        {"$set": {"online": True, "last_seen": utcnow()}}
+    )
+    await sio.emit("registered", {"status": "ok", "user_id": user_id}, to=sid)
 
 @sio.event
 async def offer(sid, data):
     """WebRTC offer signal"""
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+    if await socket_rate_limited(sid, f"socket-offer:{user_id}", "socket_offer", "Too many call offers."):
+        return
+
     target_id = data.get("target_id")
-    if target_id in active_users:
-        await sio.emit("offer", {
-            "offer": data.get("offer"),
-            "from_id": data.get("from_id"),
-            "call_id": data.get("call_id")
-        }, to=active_users[target_id])
+    if not target_id:
+        return
+    if await are_users_blocked(user_id, target_id):
+        await sio.emit("error", {"detail": "You cannot call this user."}, to=sid)
+        return
+
+    await sio.emit("offer", {
+        "offer": data.get("offer"),
+        "from_id": user_id,
+        "call_id": data.get("call_id")
+    }, room=user_room(target_id))
 
 @sio.event
 async def answer(sid, data):
     """WebRTC answer signal"""
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+    if await socket_rate_limited(sid, f"socket-answer:{user_id}", "socket_answer", "Too many call answers."):
+        return
+
     target_id = data.get("target_id")
-    if target_id in active_users:
-        await sio.emit("answer", {
-            "answer": data.get("answer"),
-            "from_id": data.get("from_id"),
-            "call_id": data.get("call_id")
-        }, to=active_users[target_id])
+    if not target_id:
+        return
+    if await are_users_blocked(user_id, target_id):
+        await sio.emit("error", {"detail": "You cannot answer this user."}, to=sid)
+        return
+
+    await sio.emit("answer", {
+        "answer": data.get("answer"),
+        "from_id": user_id,
+        "call_id": data.get("call_id")
+    }, room=user_room(target_id))
 
 @sio.event
 async def ice_candidate(sid, data):
     """WebRTC ICE candidate"""
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+    if await socket_rate_limited(sid, f"socket-ice:{user_id}", "socket_ice", "Too many ICE candidates."):
+        return
+
     target_id = data.get("target_id")
-    if target_id in active_users:
-        await sio.emit("ice_candidate", {
-            "candidate": data.get("candidate"),
-            "from_id": data.get("from_id")
-        }, to=active_users[target_id])
+    if not target_id:
+        return
+    if await are_users_blocked(user_id, target_id):
+        return
+
+    await sio.emit("ice_candidate", {
+        "candidate": data.get("candidate"),
+        "from_id": user_id
+    }, room=user_room(target_id))
 
 @sio.event
 async def end_call(sid, data):
     """End call signal"""
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+
     target_id = data.get("target_id")
     call_id = data.get("call_id")
     
@@ -1123,48 +2199,110 @@ async def end_call(sid, data):
             {"call_id": call_id},
             {"$set": {
                 "status": "ended",
-                "ended_at": datetime.now(timezone.utc),
+                "ended_at": utcnow(),
                 "duration": data.get("duration", 0)
             }}
         )
     
-    if target_id in active_users:
+    if target_id:
         await sio.emit("call_ended", {
-            "from_id": data.get("from_id"),
+            "from_id": user_id,
             "call_id": call_id
-        }, to=active_users[target_id])
+        }, room=user_room(target_id))
 
 @sio.event
 async def chat_message(sid, data):
     """In-call chat message"""
-    target_id = data.get("target_id")
-    if target_id in active_users:
-        await sio.emit("chat_message", {
-            "message": data.get("message"),
-            "from_id": data.get("from_id")
-        }, to=active_users[target_id])
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+    if await socket_rate_limited(sid, f"socket-chat:{user_id}", "socket_chat", "Too many chat messages."):
+        return
 
-# ============ HEALTH & STATS ============
+    target_id = data.get("target_id")
+    message = (data.get("message") or "").strip()
+    if not target_id or not message:
+        return
+    if await are_users_blocked(user_id, target_id):
+        await sio.emit("error", {"detail": "This chat is unavailable due to a block."}, to=sid)
+        return
+
+    moderation_issue = content_is_disallowed(message, field_name="Message")
+    if moderation_issue:
+        await record_moderation_incident(user_id, message, moderation_issue, "chat_message")
+        await sio.emit("error", {"detail": moderation_issue}, to=sid)
+        return
+
+    await db.messages.insert_one(
+        {
+            "message_id": f"msg_{uuid.uuid4().hex[:12]}",
+            "sender_id": user_id,
+            "receiver_id": target_id,
+            "content": message,
+            "created_at": utcnow(),
+        }
+    )
+
+    await sio.emit("chat_message", {
+        "message": message,
+        "from_id": user_id
+    }, room=user_room(target_id))
+
+# ============ HEALTH & STATS ============ 
+
+@app.get("/api/rtc-config")
+async def get_rtc_config():
+    return {
+        "ice_servers": build_ice_servers(),
+        "turn_enabled": TURN_ENABLED,
+        "turn_required": turn_required(),
+    }
 
 @app.get("/api/health")
 async def health_check():
+    db_connected = await ping_database()
+    redis_connected = await ping_redis() if REDIS_URL else False
+    online_count = await get_online_user_count()
+    service_ready = db_connected and (not REDIS_URL or redis_connected) and (not turn_required() or TURN_ENABLED)
+
     return {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "online_users": len(active_users)
+        "status": "healthy" if service_ready else "degraded",
+        "timestamp": utcnow().isoformat(),
+        "online_users": online_count,
+        "environment": APP_ENV,
+        "same_wifi_strategy": "request_ip_plus_browser_fingerprint",
+        "turn_enabled": TURN_ENABLED,
+        "turn_required": turn_required(),
+        "database_connected": db_connected,
+        "database_error": db_last_error,
+        "redis_connected": redis_connected,
+        "redis_error": redis_last_error,
     }
 
 @app.get("/api/stats")
 async def get_stats():
     """Get platform statistics"""
+    online_count = await get_online_user_count()
+    if not await ping_database():
+        return {
+            "status": "degraded",
+            "database_connected": False,
+            "total_users": 0,
+            "online_users": online_count,
+            "total_calls": 0,
+            "database_error": db_last_error,
+        }
+
     total_users = await db.users.count_documents({})
-    online_users = len(active_users)
     total_calls = await db.call_history.count_documents({})
     
     return {
+        "status": "healthy",
+        "database_connected": True,
         "total_users": total_users,
-        "online_users": online_users,
-        "total_calls": total_calls
+        "online_users": online_count,
+        "total_calls": total_calls,
     }
 
 # For running with socket.io

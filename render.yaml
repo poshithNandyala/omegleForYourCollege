@@ -1,0 +1,92 @@
+services:
+  - type: keyvalue
+    name: campuslink-cache
+    ipAllowList: []
+
+  - type: web
+    name: campuslink-api
+    runtime: python
+    plan: standard
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    autoDeployTrigger: commit
+    healthCheckPath: /api/health
+    numInstances: 2
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: DB_NAME
+        value: campuslink
+      - key: ALLOW_LAN_ORIGINS
+        value: "false"
+      - key: TRUST_PROXY_HEADERS
+        value: "true"
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: COOKIE_SAMESITE
+        value: none
+      - key: CORS_ORIGINS
+        sync: false
+      - key: REQUIRE_REDIS_IN_PRODUCTION
+        value: "true"
+      - key: REQUIRE_TURN_IN_PRODUCTION
+        value: "true"
+      - key: MONGO_SERVER_SELECTION_TIMEOUT_MS
+        value: "5000"
+      - key: MONGO_CONNECT_TIMEOUT_MS
+        value: "5000"
+      - key: MONGO_SOCKET_TIMEOUT_MS
+        value: "5000"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: campuslink-cache
+          property: connectionString
+      - key: REDIS_NAMESPACE
+        value: campuslink
+      - key: JWT_SECRET
+        generateValue: true
+      - key: MONGO_URL
+        sync: false
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM
+        sync: false
+      - key: EMERGENT_LLM_KEY
+        sync: false
+      - key: TURN_URL
+        sync: false
+      - key: TURN_USERNAME
+        sync: false
+      - key: TURN_CREDENTIAL
+        sync: false
+
+  - type: web
+    name: campuslink-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: build
+    autoDeployTrigger: commit
+    envVars:
+      - key: REACT_APP_BACKEND_URL
+        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /*
+        name: X-Frame-Options
+        value: DENY
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin

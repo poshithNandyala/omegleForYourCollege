@@ -7,13 +7,165 @@ import {
   Users, Video, Phone, PhoneOff, Mic, MicOff, VideoOff,
   MessageSquare, UserPlus, History, Settings, LogOut,
   Wifi, Building2, Globe, Heart, Briefcase, BookOpen,
-  Sparkles, Send, X, Check, Loader2, ChevronRight
+  Sparkles, Send, X, Check, Loader2, ChevronRight,
+  ShieldAlert, Ban, Flag
 } from 'lucide-react';
 
-const API_URL = process.env.REACT_APP_BACKEND_URL;
+const trimTrailingSlash = (value) => value.replace(/\/+$/, '');
+
+const resolveDefaultApiUrl = () => {
+  if (typeof window === 'undefined') {
+    return 'http://localhost:8001';
+  }
+
+  const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+  return `${protocol}//${window.location.hostname}:8001`;
+};
+
+const API_URL = trimTrailingSlash(process.env.REACT_APP_BACKEND_URL || resolveDefaultApiUrl());
+const MATCH_POLL_INTERVAL_MS = 3000;
+const MATCH_WAIT_TIMEOUT_MS = 60000;
+const DEFAULT_ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
 
 // Axios config
 axios.defaults.withCredentials = true;
+axios.defaults.baseURL = API_URL;
+
+const getRtcConfig = async () => {
+  try {
+    const { data } = await axios.get('/api/rtc-config');
+    if (Array.isArray(data.ice_servers) && data.ice_servers.length > 0) {
+      return data;
+    }
+  } catch (error) {
+    console.error('RTC config error:', error);
+  }
+
+  return {
+    ice_servers: DEFAULT_ICE_SERVERS,
+    turn_enabled: false,
+    turn_required: false,
+  };
+};
+
+const getErrorMessage = (error, fallback) =>
+  error?.response?.data?.detail || error?.message || fallback;
+
+const hashText = async (value) => {
+  if (!value) {
+    return null;
+  }
+
+  if (!window.crypto?.subtle || typeof TextEncoder === 'undefined') {
+    return btoa(value).replace(/=/g, '').slice(0, 32);
+  }
+
+  const buffer = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(buffer))
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 32);
+};
+
+const extractPrivateSubnet = (candidateString) => {
+  const matches = candidateString.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/g);
+  if (!matches) {
+    return null;
+  }
+
+  for (const ipAddress of matches) {
+    const octets = ipAddress.split('.').map(Number);
+    if (octets.length !== 4 || octets.some((octet) => Number.isNaN(octet) || octet < 0 || octet > 255)) {
+      continue;
+    }
+
+    const [first, second, third] = octets;
+    const isPrivate =
+      first === 10 ||
+      (first === 172 && second >= 16 && second <= 31) ||
+      (first === 192 && second === 168);
+
+    if (isPrivate) {
+      return `${first}.${second}.${third}`;
+    }
+  }
+
+  return null;
+};
+
+const deriveSameNetworkFingerprint = async () => {
+  if (typeof window === 'undefined' || typeof RTCPeerConnection === 'undefined') {
+    return null;
+  }
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let detectedSubnet = null;
+    const peerConnection = new RTCPeerConnection({ iceServers: [] });
+
+    const finish = async (subnet) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutId);
+      peerConnection.onicecandidate = null;
+      try {
+        peerConnection.close();
+      } catch (error) {
+        console.debug('Network probe close error:', error);
+      }
+
+      if (!subnet) {
+        resolve(null);
+        return;
+      }
+
+      try {
+        resolve(await hashText(`same-network:${subnet}`));
+      } catch (error) {
+        console.debug('Network probe hash error:', error);
+        resolve(null);
+      }
+    };
+
+    const timeoutId = window.setTimeout(() => {
+      void finish(detectedSubnet);
+    }, 1500);
+
+    peerConnection.createDataChannel('campuslink-network-probe');
+    peerConnection.onicecandidate = (event) => {
+      if (!event.candidate) {
+        void finish(detectedSubnet);
+        return;
+      }
+
+      const subnet = extractPrivateSubnet(event.candidate.candidate || '');
+      if (subnet) {
+        detectedSubnet = subnet;
+        void finish(subnet);
+      }
+    };
+
+    peerConnection
+      .createOffer()
+      .then((offer) => peerConnection.setLocalDescription(offer))
+      .catch(() => {
+        void finish(null);
+      });
+  });
+};
+
+const setAuthHeader = (token) => {
+  if (token) {
+    axios.defaults.headers.common.Authorization = `Bearer ${token}`;
+  } else {
+    delete axios.defaults.headers.common.Authorization;
+  }
+};
 
 // Auth Context
 const AuthContext = createContext(null);
@@ -30,14 +182,16 @@ const AuthProvider = ({ children }) => {
       setLoading(false);
       return;
     }
-    
+
+    const token = localStorage.getItem('access_token');
+    setAuthHeader(token);
+
     try {
-      const token = localStorage.getItem('access_token');
-      const headers = token ? { Authorization: `Bearer ${token}` } : {};
-      const { data } = await axios.get(`${API_URL}/api/auth/me`, { headers });
+      const { data } = await axios.get('/api/auth/me');
       setUser(data);
     } catch (error) {
       setUser(null);
+      setAuthHeader(null);
       localStorage.removeItem('access_token');
     } finally {
       setLoading(false);
@@ -50,14 +204,18 @@ const AuthProvider = ({ children }) => {
 
   const login = (userData, token) => {
     setUser(userData);
-    if (token) localStorage.setItem('access_token', token);
+    if (token) {
+      localStorage.setItem('access_token', token);
+      setAuthHeader(token);
+    }
   };
 
   const logout = async () => {
     try {
-      await axios.post(`${API_URL}/api/auth/logout`);
-    } catch (e) {}
+      await axios.post('/api/auth/logout');
+    } catch (e) { }
     setUser(null);
+    setAuthHeader(null);
     localStorage.removeItem('access_token');
   };
 
@@ -136,7 +294,7 @@ const LandingPage = () => {
               Find study buddies, networking partners, co-founders, or maybe even love.
               Connect with students from your college or across India.
             </p>
-            
+
             <div className="flex flex-wrap gap-4 mb-12">
               <button
                 data-testid="get-started-btn"
@@ -152,7 +310,7 @@ const LandingPage = () => {
             <div className="grid grid-cols-2 gap-4">
               {[
                 { icon: Building2, text: 'Same College', color: 'bg-accent-mint' },
-                { icon: Wifi, text: 'Same WiFi', color: 'bg-accent-yellow' },
+                { icon: Wifi, text: 'Same Network', color: 'bg-accent-yellow' },
                 { icon: Globe, text: 'Cross College', color: 'bg-accent-lilac' },
                 { icon: Sparkles, text: 'AI Matching', color: 'bg-primary' },
               ].map((feat, i) => (
@@ -322,10 +480,10 @@ const LoginPage = () => {
             className="btn-brutal bg-surface w-full flex items-center justify-center gap-3"
           >
             <svg className="w-5 h-5" viewBox="0 0 24 24">
-              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+              <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+              <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+              <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
+              <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
             </svg>
             Continue with Google
           </button>
@@ -663,7 +821,7 @@ const AuthCallback = () => {
     const processCallback = async () => {
       const hash = window.location.hash;
       const sessionIdMatch = hash.match(/session_id=([^&]+)/);
-      
+
       if (!sessionIdMatch) {
         navigate('/login');
         return;
@@ -705,7 +863,7 @@ const Dashboard = () => {
       try {
         const { data } = await axios.get(`${API_URL}/api/stats`);
         setStats(data);
-      } catch (e) {}
+      } catch (e) { }
     };
     fetchStats();
     const interval = setInterval(fetchStats, 30000);
@@ -725,7 +883,7 @@ const Dashboard = () => {
       <header className="bg-surface border-b-2 border-border p-4">
         <div className="max-w-7xl mx-auto flex items-center justify-between">
           <h1 className="font-heading text-2xl font-black">CampusLink</h1>
-          
+
           <div className="flex items-center gap-6">
             <div className="hidden md:flex items-center gap-4 text-sm">
               <span className="flex items-center gap-2">
@@ -734,7 +892,7 @@ const Dashboard = () => {
               </span>
               <span>{stats.total_calls} calls made</span>
             </div>
-            
+
             <div className="flex items-center gap-3">
               <span className="font-bold">{user?.name}</span>
               <button
@@ -786,6 +944,22 @@ const ConnectTab = () => {
   const [matchedUser, setMatchedUser] = useState(null);
   const [callId, setCallId] = useState(null);
   const [inCall, setInCall] = useState(false);
+  const [isInitiator, setIsInitiator] = useState(false);
+  const [matchError, setMatchError] = useState('');
+  const pollTimeoutRef = useRef(null);
+  const isCancelledRef = useRef(false);
+
+  const clearPendingPoll = () => {
+    if (pollTimeoutRef.current) {
+      clearTimeout(pollTimeoutRef.current);
+      pollTimeoutRef.current = null;
+    }
+  };
+
+  useEffect(() => () => {
+    isCancelledRef.current = true;
+    clearPendingPoll();
+  }, []);
 
   const connectionModes = [
     {
@@ -797,8 +971,8 @@ const ConnectTab = () => {
     },
     {
       id: 'same_wifi',
-      title: 'Same WiFi',
-      desc: 'Connect with people nearby',
+      title: 'Same Network',
+      desc: 'Best effort for campus WiFi or local LAN users',
       icon: Wifi,
       color: 'bg-accent-yellow',
     },
@@ -812,37 +986,76 @@ const ConnectTab = () => {
   ];
 
   const startMatching = async (selectedMode) => {
+    clearPendingPoll();
+    isCancelledRef.current = false;
+    setMatchError('');
     setMode(selectedMode);
     setMatching(true);
+    const networkFingerprint = selectedMode === 'same_wifi'
+      ? await deriveSameNetworkFingerprint()
+      : null;
+    const startedAt = Date.now();
 
-    try {
-      const pollMatch = async () => {
-        const { data } = await axios.post(`${API_URL}/api/match/find`, {
+    const pollMatch = async () => {
+      if (isCancelledRef.current) {
+        return;
+      }
+
+      try {
+        const requestBody = {
           mode: selectedMode,
-        });
+        };
+
+        if (networkFingerprint) {
+          requestBody.network_fingerprint = networkFingerprint;
+        }
+
+        const { data } = await axios.post('/api/match/find', requestBody);
 
         if (data.status === 'matched') {
+          clearPendingPoll();
           setMatchedUser(data.matched_user);
           setCallId(data.call_id);
+          setIsInitiator(Boolean(data.is_initiator));
           setMatching(false);
           setInCall(true);
-        } else {
-          // Keep polling
-          setTimeout(pollMatch, 3000);
+          return;
         }
-      };
 
-      pollMatch();
-    } catch (err) {
-      console.error('Matching error:', err);
-      setMatching(false);
-    }
+        if (Date.now() - startedAt >= MATCH_WAIT_TIMEOUT_MS) {
+          setMatching(false);
+          setMode(null);
+          setMatchError('No one is available right now. Try again in a minute.');
+          return;
+        }
+
+        pollTimeoutRef.current = setTimeout(pollMatch, MATCH_POLL_INTERVAL_MS);
+      } catch (err) {
+        if (err.response?.status === 401) {
+          console.error('Matching unauthorized, stopping polling.');
+          clearPendingPoll();
+          setMatching(false);
+          setMode(null);
+          return;
+        }
+
+        console.error('Matching error:', err);
+        clearPendingPoll();
+        setMatchError(getErrorMessage(err, 'Could not start matching. Check backend reachability and try again.'));
+        setMatching(false);
+        setMode(null);
+      }
+    };
+
+    await pollMatch();
   };
 
   const cancelMatching = async () => {
+    isCancelledRef.current = true;
+    clearPendingPoll();
     try {
-      await axios.post(`${API_URL}/api/match/cancel`);
-    } catch (e) {}
+      await axios.post('/api/match/cancel');
+    } catch (e) { }
     setMatching(false);
     setMode(null);
   };
@@ -852,6 +1065,7 @@ const ConnectTab = () => {
     setMatchedUser(null);
     setCallId(null);
     setMode(null);
+    setIsInitiator(false);
   };
 
   if (inCall && matchedUser) {
@@ -860,6 +1074,7 @@ const ConnectTab = () => {
         matchedUser={matchedUser}
         callId={callId}
         mode={mode}
+        isInitiator={isInitiator}
         onEndCall={endCall}
       />
     );
@@ -880,12 +1095,12 @@ const ConnectTab = () => {
               <Users className="w-8 h-8 text-text-primary" strokeWidth={2.5} />
             </div>
           </div>
-          
+
           <h2 className="font-heading text-2xl font-bold mb-4">Finding your match...</h2>
           <p className="text-text-secondary mb-8">
             Looking for someone in {mode === 'same_college' ? user?.college : mode === 'same_wifi' ? 'your network' : 'other colleges'}
           </p>
-          
+
           <button
             data-testid="cancel-matching-btn"
             onClick={cancelMatching}
@@ -897,7 +1112,13 @@ const ConnectTab = () => {
       ) : (
         <>
           <h2 className="font-heading text-3xl font-black mb-6">Choose Connection Mode</h2>
-          
+
+          {matchError && (
+            <div className="bg-red-100 border-2 border-red-500 p-4 mb-6 text-red-700">
+              {matchError}
+            </div>
+          )}
+
           <div className="grid md:grid-cols-3 gap-6">
             {connectionModes.map((connMode) => (
               <motion.button
@@ -913,6 +1134,11 @@ const ConnectTab = () => {
               </motion.button>
             ))}
           </div>
+
+          <p className="mt-4 text-sm text-text-secondary">
+            Same Network uses your request IP and, when the browser exposes it, a hashed local subnet fingerprint.
+            Browsers do not expose the actual WiFi SSID.
+          </p>
 
           {/* AI Suggestions */}
           <div className="mt-8">
@@ -940,7 +1166,7 @@ const ConnectTab = () => {
 };
 
 // Video Call Component
-const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
+const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
   const { user } = useAuth();
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
@@ -948,34 +1174,58 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
   const [iceBreakers, setIceBreakers] = useState([]);
+  const [callError, setCallError] = useState('');
+  const [actionFeedback, setActionFeedback] = useState('');
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportReason, setReportReason] = useState('harassment');
+  const [reportDetails, setReportDetails] = useState('');
+  const [actionLoading, setActionLoading] = useState('');
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const socketRef = useRef(null);
   const localStreamRef = useRef(null);
+  const reportReasonOptions = [
+    { id: 'harassment', label: 'Harassment' },
+    { id: 'hate', label: 'Hate speech' },
+    { id: 'spam', label: 'Spam' },
+    { id: 'sexual_content', label: 'Sexual content' },
+    { id: 'violence', label: 'Violence' },
+    { id: 'impersonation', label: 'Impersonation' },
+    { id: 'other', label: 'Other' },
+  ];
+
+  const handleEndCall = (notifyPeer = true) => {
+    if (notifyPeer && socketRef.current) {
+      socketRef.current.emit('end_call', {
+        target_id: matchedUser.user_id,
+        call_id: callId
+      });
+    }
+    onEndCall();
+  };
 
   // Fetch ice breakers
   useEffect(() => {
     const fetchIceBreakers = async () => {
       try {
-        const token = localStorage.getItem('access_token');
-        const { data } = await axios.post(
-          `${API_URL}/api/ai/ice-breaker`,
-          { other_user_id: matchedUser.user_id },
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
+        const { data } = await axios.post('/api/ai/ice-breaker', {
+          other_user_id: matchedUser.user_id
+        });
         if (typeof data.ice_breakers === 'string') {
           setIceBreakers(data.ice_breakers.split('\n').filter(s => s.trim()));
         } else {
           setIceBreakers(data.ice_breakers || []);
         }
-      } catch (e) {}
+      } catch (e) { }
     };
     fetchIceBreakers();
   }, [matchedUser]);
 
   // WebRTC Setup
   useEffect(() => {
+    let isMounted = true;
+
     const setupCall = async () => {
       try {
         // Get local media
@@ -983,6 +1233,10 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
           video: true,
           audio: true
         });
+        if (!isMounted) {
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
         localStreamRef.current = stream;
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = stream;
@@ -992,22 +1246,39 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
         const wsUrl = API_URL.replace('https://', 'wss://').replace('http://', 'ws://');
         socketRef.current = io(wsUrl, {
           transports: ['websocket'],
-          withCredentials: true
+          withCredentials: true,
+          reconnection: true,
+          reconnectionAttempts: 8,
+          reconnectionDelay: 1000,
         });
 
-        socketRef.current.on('connect', () => {
-          socketRef.current.emit('register_user', { user_id: user.user_id });
-        });
+        const registerSocketUser = () => {
+          const accessToken = localStorage.getItem('access_token');
+          if (!accessToken) {
+            setCallError('Your session expired. Please log in again before starting a call.');
+            return;
+          }
 
-        // WebRTC setup
-        const config = {
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-          ]
+          socketRef.current.emit('register_user', {
+            user_id: user.user_id,
+            access_token: accessToken,
+          });
         };
 
-        peerConnectionRef.current = new RTCPeerConnection(config);
+        socketRef.current.on('connect', registerSocketUser);
+
+        if (socketRef.current.connected) {
+          registerSocketUser();
+        }
+
+        const rtcConfig = await getRtcConfig();
+        if (rtcConfig.turn_required && !rtcConfig.turn_enabled) {
+          throw new Error('TURN relay is required before calls can start in production.');
+        }
+
+        peerConnectionRef.current = new RTCPeerConnection({
+          iceServers: rtcConfig.ice_servers
+        });
 
         // Add local tracks
         stream.getTracks().forEach(track => {
@@ -1027,32 +1298,19 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
             socketRef.current.emit('ice_candidate', {
               candidate: event.candidate,
               target_id: matchedUser.user_id,
-              from_id: user.user_id
             });
           }
         };
-
-        // Create and send offer
-        const offer = await peerConnectionRef.current.createOffer();
-        await peerConnectionRef.current.setLocalDescription(offer);
-        
-        socketRef.current.emit('offer', {
-          offer: offer,
-          target_id: matchedUser.user_id,
-          from_id: user.user_id,
-          call_id: callId
-        });
 
         // Handle incoming offer
         socketRef.current.on('offer', async (data) => {
           await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.offer));
           const answer = await peerConnectionRef.current.createAnswer();
           await peerConnectionRef.current.setLocalDescription(answer);
-          
+
           socketRef.current.emit('answer', {
             answer: answer,
             target_id: data.from_id,
-            from_id: user.user_id,
             call_id: callId
           });
         });
@@ -1066,7 +1324,7 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
         socketRef.current.on('ice_candidate', async (data) => {
           try {
             await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate));
-          } catch (e) {}
+          } catch (e) { }
         });
 
         // Handle chat messages
@@ -1074,19 +1332,38 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
           setMessages(prev => [...prev, { from: 'them', text: data.message }]);
         });
 
+        socketRef.current.on('error', (data) => {
+          setCallError(data?.detail || 'A realtime error interrupted the call.');
+        });
+
         // Handle call ended
         socketRef.current.on('call_ended', () => {
-          handleEndCall();
+          handleEndCall(false);
         });
+
+        if (isInitiator) {
+          const offer = await peerConnectionRef.current.createOffer();
+          await peerConnectionRef.current.setLocalDescription(offer);
+
+          socketRef.current.emit('offer', {
+            offer,
+            target_id: matchedUser.user_id,
+            call_id: callId
+          });
+        }
 
       } catch (err) {
         console.error('Call setup error:', err);
+        if (isMounted) {
+          setCallError(getErrorMessage(err, 'Could not start the video call. Camera, microphone, or network setup is blocking it.'));
+        }
       }
     };
 
     setupCall();
 
     return () => {
+      isMounted = false;
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(track => track.stop());
       }
@@ -1097,7 +1374,7 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
         socketRef.current.disconnect();
       }
     };
-  }, [user, matchedUser, callId]);
+  }, [user, matchedUser, callId, isInitiator]);
 
   const toggleMute = () => {
     if (localStreamRef.current) {
@@ -1117,44 +1394,66 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
     }
   };
 
-  const handleEndCall = () => {
-    if (socketRef.current) {
-      socketRef.current.emit('end_call', {
-        target_id: matchedUser.user_id,
-        from_id: user.user_id,
-        call_id: callId
-      });
-    }
-    onEndCall();
-  };
-
   const sendMessage = () => {
     if (!newMessage.trim()) return;
-    
+
     setMessages(prev => [...prev, { from: 'me', text: newMessage }]);
-    
+
     if (socketRef.current) {
       socketRef.current.emit('chat_message', {
         message: newMessage,
         target_id: matchedUser.user_id,
-        from_id: user.user_id
       });
     }
-    
+
     setNewMessage('');
   };
 
   const addFriend = async () => {
     try {
-      const token = localStorage.getItem('access_token');
-      await axios.post(
-        `${API_URL}/api/friends/add`,
-        { friend_user_id: matchedUser.user_id },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      alert('Friend added!');
+      await axios.post('/api/friends/add', { friend_user_id: matchedUser.user_id });
+      setActionFeedback('Friend added.');
     } catch (err) {
       console.error('Add friend error:', err);
+      setCallError(getErrorMessage(err, 'Could not add this user as a friend.'));
+    }
+  };
+
+  const blockMatchedUser = async () => {
+    setActionLoading('block');
+    setCallError('');
+    try {
+      await axios.post('/api/safety/block', {
+        target_user_id: matchedUser.user_id,
+        reason: `Blocked during call ${callId}`,
+      });
+      setActionFeedback('User blocked. The call will end now.');
+      handleEndCall();
+    } catch (error) {
+      setCallError(getErrorMessage(error, 'Could not block this user right now.'));
+    } finally {
+      setActionLoading('');
+    }
+  };
+
+  const submitReport = async () => {
+    setActionLoading('report');
+    setCallError('');
+    try {
+      await axios.post('/api/safety/report', {
+        reported_user_id: matchedUser.user_id,
+        reason: reportReason,
+        details: reportDetails.trim(),
+        call_id: callId,
+        auto_block: true,
+      });
+      setActionFeedback('Report submitted. The user has been blocked from your account.');
+      setReportOpen(false);
+      handleEndCall();
+    } catch (error) {
+      setCallError(getErrorMessage(error, 'Could not submit the report.'));
+    } finally {
+      setActionLoading('');
     }
   };
 
@@ -1170,6 +1469,18 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
       animate={{ opacity: 1 }}
       className="h-[calc(100vh-200px)] flex gap-4"
     >
+      {callError && (
+        <div className="absolute left-6 top-6 z-10 bg-red-100 border-2 border-red-500 px-4 py-3 text-red-700">
+          {callError}
+        </div>
+      )}
+
+      {actionFeedback && (
+        <div className="absolute right-6 top-6 z-10 bg-accent-mint border-2 border-border px-4 py-3">
+          {actionFeedback}
+        </div>
+      )}
+
       {/* Video Grid */}
       <div className="flex-1 grid grid-cols-2 gap-4">
         {/* Remote Video */}
@@ -1238,9 +1549,8 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
             {messages.map((msg, i) => (
               <div
                 key={i}
-                className={`p-3 border-2 border-border ${
-                  msg.from === 'me' ? 'bg-primary ml-4' : 'bg-surface mr-4'
-                }`}
+                className={`p-3 border-2 border-border ${msg.from === 'me' ? 'bg-primary ml-4' : 'bg-surface mr-4'
+                  }`}
               >
                 {msg.text}
               </div>
@@ -1253,7 +1563,7 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
               type="text"
               value={newMessage}
               onChange={(e) => setNewMessage(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && sendMessage()}
+              onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
               placeholder="Type a message..."
               className="input-brutal flex-1 !p-3"
             />
@@ -1262,6 +1572,58 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
             </button>
           </div>
         </motion.div>
+      )}
+
+      {reportOpen && (
+        <div className="absolute right-6 bottom-24 z-10 w-96 card-brutal bg-surface">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="font-heading text-lg font-bold">Report User</h3>
+            <button onClick={() => setReportOpen(false)}>
+              <X strokeWidth={2.5} />
+            </button>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 mb-4">
+            {reportReasonOptions.map((option) => (
+              <button
+                key={option.id}
+                onClick={() => setReportReason(option.id)}
+                className={`p-3 border-2 border-border text-sm font-bold text-left ${
+                  reportReason === option.id ? 'bg-primary' : 'bg-background'
+                }`}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+
+          <textarea
+            value={reportDetails}
+            onChange={(event) => setReportDetails(event.target.value)}
+            className="input-brutal min-h-[110px] mb-4"
+            placeholder="Add context for moderation review."
+          />
+
+          <div className="flex gap-3">
+            <button
+              onClick={submitReport}
+              disabled={actionLoading === 'report'}
+              className="btn-primary flex-1"
+            >
+              {actionLoading === 'report' ? 'Submitting...' : 'Submit Report'}
+            </button>
+            <button
+              onClick={() => setReportOpen(false)}
+              className="btn-brutal bg-surface"
+            >
+              Cancel
+            </button>
+          </div>
+
+          <p className="mt-3 text-sm text-text-secondary">
+            Reports auto-block this user from future matches and chats on your account.
+          </p>
+        </div>
       )}
 
       {/* Controls */}
@@ -1273,7 +1635,7 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
         >
           {isMuted ? <MicOff strokeWidth={2.5} /> : <Mic strokeWidth={2.5} />}
         </button>
-        
+
         <button
           data-testid="toggle-video-btn"
           onClick={toggleVideo}
@@ -1299,6 +1661,23 @@ const VideoCall = ({ matchedUser, callId, mode, onEndCall }) => {
         </button>
 
         <button
+          onClick={() => setReportOpen(true)}
+          className="btn-brutal bg-accent-yellow p-4"
+          title="Report user"
+        >
+          <Flag strokeWidth={2.5} />
+        </button>
+
+        <button
+          onClick={blockMatchedUser}
+          disabled={actionLoading === 'block'}
+          className="btn-brutal bg-red-100 text-red-700 p-4"
+          title="Block user"
+        >
+          <Ban strokeWidth={2.5} />
+        </button>
+
+        <button
           data-testid="end-call-btn"
           onClick={handleEndCall}
           className="btn-brutal bg-red-500 text-white p-4"
@@ -1318,10 +1697,7 @@ const FriendsTab = () => {
   useEffect(() => {
     const fetchFriends = async () => {
       try {
-        const token = localStorage.getItem('access_token');
-        const { data } = await axios.get(`${API_URL}/api/friends`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+        const { data } = await axios.get('/api/friends');
         setFriends(data.friends || []);
       } catch (e) {
         console.error('Error fetching friends:', e);
@@ -1369,7 +1745,7 @@ const FriendsTab = () => {
                   <p className="text-sm text-text-secondary">{friend.college}</p>
                 </div>
               </div>
-              
+
               <div className="mt-4 flex flex-wrap gap-2">
                 {friend.interests?.slice(0, 3).map((interest) => (
                   <span key={interest} className="px-2 py-1 bg-accent-lilac border border-border text-xs font-bold">
@@ -1402,10 +1778,7 @@ const HistoryTab = () => {
   useEffect(() => {
     const fetchHistory = async () => {
       try {
-        const token = localStorage.getItem('access_token');
-        const { data } = await axios.get(`${API_URL}/api/calls/history`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+        const { data } = await axios.get('/api/calls/history');
         setHistory(data.calls || []);
       } catch (e) {
         console.error('Error fetching history:', e);
@@ -1418,7 +1791,7 @@ const HistoryTab = () => {
 
   const modeLabels = {
     same_college: { label: 'Same College', color: 'bg-accent-mint' },
-    same_wifi: { label: 'Same WiFi', color: 'bg-accent-yellow' },
+    same_wifi: { label: 'Same Network', color: 'bg-accent-yellow' },
     cross_college: { label: 'Cross College', color: 'bg-accent-lilac' }
   };
 
@@ -1459,7 +1832,7 @@ const HistoryTab = () => {
                   </p>
                 </div>
               </div>
-              
+
               <div className="text-right">
                 <p className="text-sm text-text-secondary">
                   {new Date(call.created_at).toLocaleDateString()}
@@ -1478,13 +1851,18 @@ const HistoryTab = () => {
 
 // Profile Tab
 const ProfileTab = () => {
-  const { user, logout } = useAuth();
+  const { user, logout, checkAuth } = useAuth();
   const [name, setName] = useState(user?.name || '');
   const [bio, setBio] = useState(user?.bio || '');
   const [interests, setInterests] = useState(user?.interests || []);
   const [lookingFor, setLookingFor] = useState(user?.looking_for || []);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState('');
+  const [blockedUsers, setBlockedUsers] = useState([]);
+  const [loadingBlocks, setLoadingBlocks] = useState(true);
+  const [blocksError, setBlocksError] = useState('');
+  const [unblockingUserId, setUnblockingUserId] = useState('');
 
   const interestOptions = ['Coding', 'Design', 'Business', 'Music', 'Sports', 'Art', 'Gaming', 'Reading', 'Travel', 'Fitness'];
   const lookingForOptions = [
@@ -1506,21 +1884,61 @@ const ProfileTab = () => {
     );
   };
 
+  const loadBlockedUsers = useCallback(async () => {
+    setLoadingBlocks(true);
+    setBlocksError('');
+    try {
+      const { data } = await axios.get('/api/safety/blocks');
+      setBlockedUsers(data.blocked_users || []);
+    } catch (error) {
+      setBlocksError(getErrorMessage(error, 'Could not load blocked users.'));
+    } finally {
+      setLoadingBlocks(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    setName(user?.name || '');
+    setBio(user?.bio || '');
+    setInterests(user?.interests || []);
+    setLookingFor(user?.looking_for || []);
+  }, [user]);
+
+  useEffect(() => {
+    loadBlockedUsers();
+  }, [loadBlockedUsers]);
+
   const saveProfile = async () => {
     setSaving(true);
+    setSaveError('');
     try {
-      const token = localStorage.getItem('access_token');
-      await axios.put(
-        `${API_URL}/api/users/profile`,
-        { name, bio, interests, looking_for: lookingFor },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
+      await axios.put('/api/users/profile', {
+        name,
+        bio,
+        interests,
+        looking_for: lookingFor,
+      });
+      await checkAuth();
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
-    } catch (e) {
-      console.error('Save error:', e);
+    } catch (error) {
+      console.error('Save error:', error);
+      setSaveError(getErrorMessage(error, 'Could not save your profile.'));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const unblockUser = async (targetUserId) => {
+    setUnblockingUserId(targetUserId);
+    setBlocksError('');
+    try {
+      await axios.delete(`/api/safety/block/${targetUserId}`);
+      await loadBlockedUsers();
+    } catch (error) {
+      setBlocksError(getErrorMessage(error, 'Could not unblock this user.'));
+    } finally {
+      setUnblockingUserId('');
     }
   };
 
@@ -1532,10 +1950,16 @@ const ProfileTab = () => {
     >
       <h2 className="font-heading text-3xl font-black mb-6">Your Profile</h2>
 
+      {saveError && (
+        <div className="bg-red-100 border-2 border-red-500 p-4 mb-6 text-red-700">
+          {saveError}
+        </div>
+      )}
+
       <div className="grid lg:grid-cols-2 gap-6">
         <div className="card-brutal">
           <h3 className="font-heading text-xl font-bold mb-4">Basic Info</h3>
-          
+
           <div className="space-y-4">
             <div>
               <label className="text-xs font-bold uppercase tracking-widest mb-2 block">Name</label>
@@ -1615,6 +2039,51 @@ const ProfileTab = () => {
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="card-brutal">
+            <div className="flex items-center gap-3 mb-4">
+              <ShieldAlert className="w-6 h-6" strokeWidth={2.5} />
+              <h3 className="font-heading text-xl font-bold">Safety</h3>
+            </div>
+
+            {blocksError && (
+              <div className="bg-red-100 border-2 border-red-500 p-3 mb-4 text-red-700 text-sm">
+                {blocksError}
+              </div>
+            )}
+
+            {loadingBlocks ? (
+              <div className="flex justify-center py-6">
+                <Loader2 className="w-6 h-6 animate-spin text-primary" />
+              </div>
+            ) : blockedUsers.length === 0 ? (
+              <p className="text-text-secondary text-sm">You have not blocked anyone.</p>
+            ) : (
+              <div className="space-y-3">
+                {blockedUsers.map((blockedUser) => (
+                  <div key={blockedUser.user_id} className="border-2 border-border p-3 bg-background">
+                    <div className="flex items-center justify-between gap-4">
+                      <div>
+                        <p className="font-bold">{blockedUser.name}</p>
+                        <p className="text-sm text-text-secondary">{blockedUser.college}</p>
+                      </div>
+                      <button
+                        onClick={() => unblockUser(blockedUser.user_id)}
+                        disabled={unblockingUserId === blockedUser.user_id}
+                        className="btn-brutal bg-surface !py-2"
+                      >
+                        {unblockingUserId === blockedUser.user_id ? 'Removing...' : 'Unblock'}
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <p className="mt-4 text-sm text-text-secondary">
+              Reports auto-block users and stop future matches, chats, and calls from your account.
+            </p>
           </div>
         </div>
       </div>
