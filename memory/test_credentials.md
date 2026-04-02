@@ -5,6 +5,9 @@
 - **Password:** CampusLink@2024
 - **Role:** admin
 
+## Dev OTP Bypass
+- **Code:** `123456` (works for any college email during signup)
+
 ## Auth Endpoints
 - POST `/api/auth/send-otp` - Send OTP to college email
 - POST `/api/auth/verify-otp` - Verify OTP code
