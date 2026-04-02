@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Outfit', sans-serif;
+  background-color: #FFF8E7;
+  color: #121212;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Bricolage Grotesque', sans-serif;
+}
+
+/* Neo-Brutalist Button Base */
+.btn-brutal {
+  @apply font-bold border-2 border-border rounded-none transition-all duration-200;
+  box-shadow: 4px 4px 0px #121212;
+}
+
+.btn-brutal:hover {
+  transform: translate(-2px, -2px);
+  box-shadow: 6px 6px 0px #121212;
+}
+
+.btn-brutal:active {
+  transform: translate(0, 0);
+  box-shadow: 2px 2px 0px #121212;
+}
+
+.btn-primary {
+  @apply btn-brutal bg-primary text-text-primary px-6 py-3;
+}
+
+.btn-secondary {
+  @apply btn-brutal bg-secondary text-white px-6 py-3;
+}
+
+.btn-mint {
+  @apply btn-brutal bg-accent-mint text-text-primary px-6 py-3;
+}
+
+.btn-lilac {
+  @apply btn-brutal bg-accent-lilac text-text-primary px-6 py-3;
+}
+
+.btn-yellow {
+  @apply btn-brutal bg-accent-yellow text-text-primary px-6 py-3;
+}
+
+/* Card Base */
+.card-brutal {
+  @apply bg-surface border-2 border-border p-6 rounded-none;
+  box-shadow: 4px 4px 0px #121212;
+}
+
+/* Input Base */
+.input-brutal {
+  @apply w-full p-4 text-lg border-2 border-border rounded-none bg-surface outline-none transition-all;
+}
+
+.input-brutal:focus {
+  border-color: #2563EB;
+  box-shadow: 4px 4px 0px #2563EB;
+}
+
+/* Animation */
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-slide-up {
+  animation: slideUp 0.4s ease-out forwards;
+}
+
+.animate-pulse-slow {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #FFF8E7;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #121212;
+  border: 2px solid #FFF8E7;
+}
+
+/* Selection */
+::selection {
+  background: #FF49DB;
+  color: #121212;
+}
