@@ -287,7 +287,11 @@ app = FastAPI(title="CampusLink API", lifespan=lifespan)
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://yjyzhjf6-pnky.preview.emergentagent.com",
+        "http://localhost:8001"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
