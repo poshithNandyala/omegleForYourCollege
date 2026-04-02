@@ -55,6 +55,19 @@ const getRtcConfig = async () => {
 const getErrorMessage = (error, fallback) =>
   error?.response?.data?.detail || error?.message || fallback;
 
+const ensureVideoPlayback = (videoElement) => {
+  if (!videoElement?.play) {
+    return;
+  }
+
+  const playPromise = videoElement.play();
+  if (playPromise && typeof playPromise.catch === 'function') {
+    playPromise.catch((error) => {
+      console.debug('Video playback pending user gesture:', error);
+    });
+  }
+};
+
 const hashText = async (value) => {
   if (!value) {
     return null;
@@ -1434,9 +1447,12 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
   const [unreadMessages, setUnreadMessages] = useState(0);
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
+  const remoteStreamRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const socketRef = useRef(null);
   const localStreamRef = useRef(null);
+  const pendingIceCandidatesRef = useRef([]);
+  const messagesEndRef = useRef(null);
   const remoteReadyRef = useRef(false);
   const offerStartedRef = useRef(false);
   const socketRegisteredRef = useRef(false);
@@ -1477,6 +1493,19 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
     fetchIceBreakers();
   }, [matchedUser]);
 
+  useEffect(() => {
+    if (!chatOpen) {
+      return;
+    }
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  }, [messages, chatOpen]);
+
+  useEffect(() => {
+    if (chatOpen && unreadMessages > 0) {
+      setUnreadMessages(0);
+    }
+  }, [chatOpen, unreadMessages]);
+
   // WebRTC Setup
   useEffect(() => {
     let isMounted = true;
@@ -1488,6 +1517,12 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         socketRegisteredRef.current = false;
         setCallStatus('Connecting to live call...');
         setRemoteVideoReady(false);
+        setCallError('');
+        pendingIceCandidatesRef.current = [];
+        remoteStreamRef.current = new MediaStream();
+        if (remoteVideoRef.current) {
+          remoteVideoRef.current.srcObject = remoteStreamRef.current;
+        }
 
         const mediaPromise = navigator.mediaDevices.getUserMedia({
           video: true,
@@ -1586,6 +1621,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         localStreamRef.current = stream;
         if (localVideoRef.current) {
           localVideoRef.current.srcObject = stream;
+          ensureVideoPlayback(localVideoRef.current);
         }
         if (rtcConfig.turn_required && !rtcConfig.turn_enabled) {
           throw new Error('TURN relay is required before calls can start in production.');
@@ -1596,6 +1632,22 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           iceCandidatePoolSize: 10,
         });
 
+        const flushPendingIceCandidates = async () => {
+          if (!peerConnectionRef.current?.remoteDescription?.type || pendingIceCandidatesRef.current.length === 0) {
+            return;
+          }
+
+          const queuedCandidates = [...pendingIceCandidatesRef.current];
+          pendingIceCandidatesRef.current = [];
+          for (const candidate of queuedCandidates) {
+            try {
+              await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (error) {
+              console.debug('Queued ICE candidate error:', error);
+            }
+          }
+        };
+
         // Add local tracks
         stream.getTracks().forEach(track => {
           peerConnectionRef.current.addTrack(track, stream);
@@ -1603,8 +1655,17 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         // Handle remote stream
         peerConnectionRef.current.ontrack = (event) => {
-          if (remoteVideoRef.current && event.streams[0]) {
-            remoteVideoRef.current.srcObject = event.streams[0];
+          if (!remoteStreamRef.current) {
+            remoteStreamRef.current = new MediaStream();
+          }
+          remoteStreamRef.current.addTrack(event.track);
+          if (remoteVideoRef.current) {
+            if (remoteVideoRef.current.srcObject !== remoteStreamRef.current) {
+              remoteVideoRef.current.srcObject = remoteStreamRef.current;
+            }
+            ensureVideoPlayback(remoteVideoRef.current);
+          }
+          if (event.track.kind === 'video') {
             setRemoteVideoReady(true);
             setCallStatus('Connected');
           }
@@ -1645,6 +1706,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         // Handle incoming offer
         socketRef.current.on('offer', async (data) => {
           await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.offer));
+          await flushPendingIceCandidates();
           const answer = await peerConnectionRef.current.createAnswer();
           await peerConnectionRef.current.setLocalDescription(answer);
 
@@ -1658,13 +1720,25 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         // Handle answer
         socketRef.current.on('answer', async (data) => {
           await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.answer));
+          await flushPendingIceCandidates();
         });
 
         // Handle ICE candidates
         socketRef.current.on('ice_candidate', async (data) => {
+          if (!data?.candidate || !peerConnectionRef.current) {
+            return;
+          }
+
+          if (!peerConnectionRef.current.remoteDescription?.type) {
+            pendingIceCandidatesRef.current.push(data.candidate);
+            return;
+          }
+
           try {
             await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate));
-          } catch (e) { }
+          } catch (error) {
+            console.debug('ICE candidate error:', error);
+          }
         });
 
         // Handle chat messages
@@ -1680,6 +1754,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             return;
           }
           remoteReadyRef.current = true;
+          setCallStatus('Peer ready. Negotiating video...');
           try {
             await sendOfferIfReady();
           } catch (error) {
@@ -1714,8 +1789,13 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
     return () => {
       isMounted = false;
+      pendingIceCandidatesRef.current = [];
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (remoteStreamRef.current) {
+        remoteStreamRef.current.getTracks().forEach(track => remoteStreamRef.current.removeTrack(track));
+        remoteStreamRef.current = null;
       }
       if (peerConnectionRef.current) {
         peerConnectionRef.current.close();
@@ -1757,6 +1837,21 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
     }
 
     setNewMessage('');
+  };
+
+  const openChatPanel = () => {
+    setChatOpen(true);
+    setUnreadMessages(0);
+  };
+
+  const toggleChatPanel = () => {
+    if (typeof window !== 'undefined' && window.innerWidth >= 1280) {
+      setChatOpen(true);
+      setUnreadMessages(0);
+      return;
+    }
+    setChatOpen((previous) => !previous);
+    setUnreadMessages(0);
   };
 
   const addFriend = async () => {
@@ -1814,76 +1909,186 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
     friend: 'bg-primary/40'
   };
 
+  const modeLabels = {
+    same_college: 'Same College',
+    same_wifi: 'Same Network',
+    cross_college: 'Cross College',
+    friend: 'Friend Call'
+  };
+  const remoteInitial = matchedUser.name?.trim()?.charAt(0)?.toUpperCase() || '?';
+
   return (
     <motion.div
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
-      className="h-[calc(100vh-200px)] flex gap-4"
+      className="relative min-h-[calc(100vh-200px)] grid gap-4 xl:grid-cols-[minmax(0,1fr)_380px]"
     >
       {callError && (
-        <div className="absolute left-6 top-6 z-10 bg-red-100 border-2 border-red-500 px-4 py-3 text-red-700">
+        <div className="absolute left-4 top-4 z-30 max-w-md bg-red-100 border-2 border-red-500 px-4 py-3 text-red-700 shadow-brutal">
           {callError}
         </div>
       )}
 
       {actionFeedback && (
-        <div className="absolute right-6 top-6 z-10 bg-accent-mint border-2 border-border px-4 py-3">
+        <div className="absolute right-4 top-4 z-30 bg-accent-mint border-2 border-border px-4 py-3 shadow-brutal">
           {actionFeedback}
         </div>
       )}
 
-      {/* Video Grid */}
-      <div className="flex-1 grid grid-cols-2 gap-4">
-        {/* Remote Video */}
-        <div className={`relative border-2 border-border ${modeColors[mode]} overflow-hidden`}>
+      <div className="min-w-0 flex flex-col gap-4">
+        <div className={`relative min-h-[68vh] overflow-hidden border-2 border-border shadow-brutal ${modeColors[mode]}`}>
           <video
             ref={remoteVideoRef}
             autoPlay
             playsInline
             className="w-full h-full object-cover"
           />
-          <div className="absolute bottom-4 left-4 bg-surface border-2 border-border px-3 py-1">
-            <span className="font-bold">{matchedUser.name}</span>
-            <span className="text-text-secondary text-sm ml-2">{matchedUser.college}</span>
-          </div>
-          <div className="absolute top-4 left-4 bg-black/55 text-white border border-white/20 px-3 py-2 backdrop-blur-md">
-            <div className="flex items-center gap-2 text-sm font-bold">
-              <Radio className="w-4 h-4" strokeWidth={2.5} />
-              {callStatus}
+          <div className="absolute inset-0 bg-gradient-to-b from-black/35 via-transparent to-black/70 pointer-events-none" />
+          <div className="absolute left-4 top-4 right-4 z-10 flex flex-wrap items-start justify-between gap-3">
+            <div className="flex max-w-[70%] items-center gap-3 rounded-[24px] border-2 border-white/30 bg-surface/82 px-4 py-3 text-text-primary backdrop-blur-xl">
+              <div className="flex h-11 w-11 items-center justify-center rounded-full bg-primary font-heading text-lg font-black text-text-primary">
+                {remoteInitial}
+              </div>
+              <div className="min-w-0">
+                <p className="truncate font-heading text-lg font-bold">{matchedUser.name}</p>
+                <p className="truncate text-sm text-text-secondary">{matchedUser.college}</p>
+              </div>
+            </div>
+            <div className="rounded-[24px] border border-white/20 bg-black/60 px-4 py-3 text-white backdrop-blur-xl">
+              <div className="flex items-center gap-2 text-sm font-bold">
+                <Radio className="w-4 h-4" strokeWidth={2.5} />
+                {callStatus}
+              </div>
             </div>
           </div>
+
+          <div className="absolute left-4 bottom-4 z-10 flex items-center gap-2 rounded-full border-2 border-border bg-surface/85 px-3 py-2 backdrop-blur-xl">
+            <span className="h-2.5 w-2.5 rounded-full bg-secondary" />
+            <span className="text-xs font-bold uppercase tracking-[0.24em]">{modeLabels[mode]}</span>
+          </div>
+
           {!remoteVideoReady && (
-            <div className="absolute inset-0 bg-black/35 backdrop-blur-[2px] flex items-center justify-center">
-              <div className="bg-surface/85 border-2 border-border px-6 py-4 shadow-brutal text-center">
-                <p className="font-heading text-lg font-bold mb-1">Getting {matchedUser.name}'s video ready</p>
+            <div className="absolute inset-0 flex items-center justify-center bg-black/35 backdrop-blur-[2px]">
+              <div className="max-w-sm border-2 border-border bg-surface/88 px-6 py-5 text-center shadow-brutal">
+                <p className="font-heading text-xl font-bold mb-2">Getting {matchedUser.name}&apos;s video ready</p>
                 <p className="text-sm text-text-secondary">{callStatus}</p>
               </div>
             </div>
           )}
+
+          <div className="absolute right-4 bottom-4 z-10 w-36 overflow-hidden rounded-[28px] border-2 border-border bg-text-primary shadow-brutal sm:w-44 lg:w-52">
+            <div className="relative aspect-video">
+              <video
+                ref={localVideoRef}
+                autoPlay
+                playsInline
+                muted
+                className="h-full w-full object-cover"
+              />
+              <div className="absolute inset-x-0 bottom-0 bg-black/55 px-3 py-2 text-sm font-bold text-white backdrop-blur-md">
+                You
+              </div>
+            </div>
+          </div>
         </div>
 
-        {/* Local Video */}
-        <div className="relative border-2 border-border bg-text-primary overflow-hidden">
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            muted
-            className="w-full h-full object-cover"
-          />
-          <div className="absolute bottom-4 left-4 bg-surface border-2 border-border px-3 py-1">
-            <span className="font-bold">You</span>
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_auto]">
+          <div className="border-2 border-border bg-gradient-to-r from-surface/90 via-white/75 to-accent-lilac/35 p-5 shadow-brutal backdrop-blur-xl">
+            <div>
+              <p className="mb-2 text-xs font-bold uppercase tracking-[0.24em] text-text-secondary">Conversation Momentum</p>
+              <h3 className="font-heading text-2xl font-bold">Keep it flowing without dead air.</h3>
+              <p className="mt-2 max-w-2xl text-sm text-text-secondary">
+                Use the prompts, keep chat open, and start talking before the video fully stabilizes.
+              </p>
+            </div>
+            {iceBreakers.length > 0 && (
+              <div className="mt-4 flex flex-wrap gap-3">
+                {iceBreakers.slice(0, 4).map((ib, i) => (
+                  <button
+                    key={i}
+                    onClick={() => setNewMessage(ib)}
+                    className="rounded-full border-2 border-border bg-accent-lilac/80 px-4 py-2 text-left text-sm font-medium transition-all hover:-translate-y-0.5 hover:shadow-brutal"
+                  >
+                    {ib}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center justify-center gap-3 rounded-[28px] border-2 border-border bg-surface/84 px-4 py-4 shadow-brutal backdrop-blur-xl">
+            <button
+              data-testid="toggle-mute-btn"
+              onClick={toggleMute}
+              className={`btn-brutal p-4 ${isMuted ? 'bg-red-500 text-white' : 'bg-surface'}`}
+            >
+              {isMuted ? <MicOff strokeWidth={2.5} /> : <Mic strokeWidth={2.5} />}
+            </button>
+
+            <button
+              data-testid="toggle-video-btn"
+              onClick={toggleVideo}
+              className={`btn-brutal p-4 ${isVideoOff ? 'bg-red-500 text-white' : 'bg-surface'}`}
+            >
+              {isVideoOff ? <VideoOff strokeWidth={2.5} /> : <Video strokeWidth={2.5} />}
+            </button>
+
+            <button
+              data-testid="chat-btn"
+              onClick={toggleChatPanel}
+              className={`btn-brutal px-4 py-4 ${chatOpen ? 'bg-secondary text-white' : 'bg-surface'}`}
+            >
+              <span className="flex items-center gap-2">
+                <MessageSquare strokeWidth={2.5} />
+                <span className="hidden md:inline">Chat</span>
+                {unreadMessages > 0 && (
+                  <span className="rounded-full bg-primary px-2 py-0.5 text-xs text-text-primary">
+                    {unreadMessages}
+                  </span>
+                )}
+              </span>
+            </button>
+
+            <button
+              data-testid="add-friend-btn"
+              onClick={addFriend}
+              className="btn-brutal bg-accent-mint p-4"
+            >
+              <UserPlus strokeWidth={2.5} />
+            </button>
+
+            <button
+              onClick={() => setReportOpen(true)}
+              className="btn-brutal bg-accent-yellow p-4"
+              title="Report user"
+            >
+              <Flag strokeWidth={2.5} />
+            </button>
+
+            <button
+              onClick={blockMatchedUser}
+              disabled={actionLoading === 'block'}
+              className="btn-brutal bg-red-100 text-red-700 p-4"
+              title="Block user"
+            >
+              <Ban strokeWidth={2.5} />
+            </button>
+
+            <button
+              data-testid="end-call-btn"
+              onClick={handleEndCall}
+              className="btn-brutal bg-red-500 text-white p-4"
+            >
+              <PhoneOff strokeWidth={2.5} />
+            </button>
           </div>
         </div>
       </div>
 
       {!chatOpen && (
         <button
-          onClick={() => {
-            setChatOpen(true);
-            setUnreadMessages(0);
-          }}
-          className="absolute right-6 top-24 z-10 border-2 border-border bg-surface/80 backdrop-blur-xl px-4 py-3 shadow-brutal"
+          onClick={openChatPanel}
+          className="fixed bottom-24 right-6 z-30 border-2 border-border bg-surface/85 px-4 py-3 shadow-brutal backdrop-blur-2xl xl:hidden"
         >
           <span className="flex items-center gap-2 font-bold">
             <Bell className="w-4 h-4" strokeWidth={2.5} />
@@ -1897,73 +2102,87 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         </button>
       )}
 
-      {/* Chat Sidebar */}
-      {chatOpen && (
-        <motion.div
-          initial={{ x: 300, opacity: 0 }}
-          animate={{ x: 0, opacity: 1 }}
-          className="absolute right-6 top-24 bottom-24 z-10 w-96 border-2 border-border bg-surface/78 backdrop-blur-xl shadow-brutal flex flex-col p-5"
-        >
-          <div className="flex justify-between items-center mb-4">
-            <div>
-              <h3 className="font-heading font-bold text-xl">Live Chat</h3>
-              <p className="text-sm text-text-secondary">Keep the conversation going while the call connects.</p>
+      <motion.aside
+        initial={{ x: 24, opacity: 0 }}
+        animate={{ x: 0, opacity: 1 }}
+        className={`${chatOpen ? 'fixed inset-x-4 top-20 bottom-24 z-20 flex' : 'hidden'} xl:static xl:inset-auto xl:z-auto xl:flex xl:min-h-0 xl:h-auto flex-col overflow-hidden border-2 border-border bg-gradient-to-b from-surface/88 via-white/76 to-accent-lilac/38 shadow-brutal backdrop-blur-2xl`}
+      >
+          <div className="border-b-2 border-border px-5 py-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.24em] text-text-secondary">In-Call Chat</p>
+                <h3 className="mt-1 font-heading text-2xl font-bold">Say something before it gets awkward.</h3>
+                <p className="mt-2 text-sm text-text-secondary">
+                  Chat stays obvious here while the call connects, stabilizes, and flows.
+                </p>
+              </div>
+              <button onClick={() => setChatOpen(false)} className="btn-brutal bg-surface p-3 xl:hidden">
+                <X strokeWidth={2.5} />
+              </button>
             </div>
-            <button onClick={() => setChatOpen(false)}>
-              <X strokeWidth={2.5} />
-            </button>
           </div>
 
-          {/* Ice Breakers */}
-          {iceBreakers.length > 0 && (
-            <div className="mb-4">
-              <p className="text-xs font-bold uppercase tracking-widest mb-2">Ice Breakers</p>
-              <div className="space-y-2">
-                {iceBreakers.slice(0, 3).map((ib, i) => (
-                  <button
-                    key={i}
-                    onClick={() => setNewMessage(ib)}
-                    className="w-full text-left p-2 bg-accent-lilac border-2 border-border text-sm hover:shadow-brutal transition-all"
-                  >
-                    {ib}
-                  </button>
-                ))}
-              </div>
+          <div className="border-b-2 border-border px-5 py-4">
+            <div className="flex flex-wrap gap-2">
+              {iceBreakers.slice(0, 4).map((ib, index) => (
+                <button
+                  key={index}
+                  onClick={() => setNewMessage(ib)}
+                  className="rounded-full border-2 border-border bg-accent-yellow/70 px-3 py-2 text-left text-sm transition-all hover:-translate-y-0.5 hover:shadow-brutal"
+                >
+                  {ib}
+                </button>
+              ))}
+              {iceBreakers.length === 0 && (
+                <p className="text-sm text-text-secondary">Ice breakers will show up here when ready.</p>
+              )}
             </div>
-          )}
+          </div>
 
-          {/* Messages */}
-          <div className="flex-1 overflow-y-auto space-y-3 mb-4 pr-1">
-            {messages.map((msg, i) => (
-              <div
-                key={i}
-                className={`p-3 border-2 border-border shadow-sm ${msg.from === 'me' ? 'bg-primary/90 ml-8' : 'bg-white/65 mr-8'
+          <div className="min-h-0 flex-1 overflow-y-auto px-5 py-5">
+            <div className="space-y-3">
+              {messages.length === 0 && (
+                <div className="rounded-[28px] border-2 border-dashed border-border bg-white/45 px-5 py-6 text-center">
+                  <Sparkles className="mx-auto mb-3 h-6 w-6" strokeWidth={2.5} />
+                  <p className="font-heading text-lg font-bold">Break the silence.</p>
+                  <p className="mt-1 text-sm text-text-secondary">Your messages will land here instantly while the call warms up.</p>
+                </div>
+              )}
+              {messages.map((msg, i) => (
+                <div
+                  key={i}
+                  className={`max-w-[84%] rounded-[24px] border-2 border-border px-4 py-3 shadow-sm ${
+                    msg.from === 'me'
+                      ? 'ml-auto bg-primary/92 text-text-primary'
+                      : 'mr-auto bg-white/68 backdrop-blur-md'
                   }`}
-              >
-                {msg.text}
-              </div>
-            ))}
+                >
+                  {msg.text}
+                </div>
+              ))}
+              <div ref={messagesEndRef} />
+            </div>
           </div>
 
-          {/* Input */}
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={newMessage}
-              onChange={(e) => setNewMessage(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
-              placeholder="Type a message..."
-              className="input-brutal flex-1 !p-3"
-            />
-            <button onClick={sendMessage} className="btn-primary !p-3">
-              <Send strokeWidth={2.5} className="w-5 h-5" />
-            </button>
+          <div className="border-t-2 border-border bg-surface/80 px-5 py-4 backdrop-blur-xl">
+            <div className="flex gap-3">
+              <input
+                type="text"
+                value={newMessage}
+                onChange={(e) => setNewMessage(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && sendMessage()}
+                placeholder="Type a message..."
+                className="input-brutal flex-1 !rounded-[22px] !p-3"
+              />
+              <button onClick={sendMessage} className="btn-primary !rounded-[22px] !p-3">
+                <Send strokeWidth={2.5} className="w-5 h-5" />
+              </button>
+            </div>
           </div>
-        </motion.div>
-      )}
+      </motion.aside>
 
       {reportOpen && (
-        <div className="absolute right-6 bottom-24 z-10 w-96 card-brutal bg-surface">
+        <div className="fixed right-4 bottom-24 z-30 w-[min(24rem,calc(100vw-2rem))] card-brutal bg-surface">
           <div className="flex items-center justify-between mb-4">
             <h3 className="font-heading text-lg font-bold">Report User</h3>
             <button onClick={() => setReportOpen(false)}>
@@ -2013,77 +2232,6 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           </p>
         </div>
       )}
-
-      {/* Controls */}
-      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 flex gap-4">
-        <button
-          data-testid="toggle-mute-btn"
-          onClick={toggleMute}
-          className={`btn-brutal p-4 ${isMuted ? 'bg-red-500' : 'bg-surface'}`}
-        >
-          {isMuted ? <MicOff strokeWidth={2.5} /> : <Mic strokeWidth={2.5} />}
-        </button>
-
-        <button
-          data-testid="toggle-video-btn"
-          onClick={toggleVideo}
-          className={`btn-brutal p-4 ${isVideoOff ? 'bg-red-500' : 'bg-surface'}`}
-        >
-          {isVideoOff ? <VideoOff strokeWidth={2.5} /> : <Video strokeWidth={2.5} />}
-        </button>
-
-        <button
-          data-testid="chat-btn"
-          onClick={() => {
-            setChatOpen(!chatOpen);
-            setUnreadMessages(0);
-          }}
-          className={`btn-brutal px-4 py-4 ${chatOpen ? 'bg-secondary text-white' : 'bg-surface'}`}
-        >
-          <span className="flex items-center gap-2">
-            <MessageSquare strokeWidth={2.5} />
-            <span className="hidden md:inline">Chat</span>
-            {unreadMessages > 0 && (
-              <span className="rounded-full bg-primary px-2 py-0.5 text-xs text-text-primary">
-                {unreadMessages}
-              </span>
-            )}
-          </span>
-        </button>
-
-        <button
-          data-testid="add-friend-btn"
-          onClick={addFriend}
-          className="btn-brutal bg-accent-mint p-4"
-        >
-          <UserPlus strokeWidth={2.5} />
-        </button>
-
-        <button
-          onClick={() => setReportOpen(true)}
-          className="btn-brutal bg-accent-yellow p-4"
-          title="Report user"
-        >
-          <Flag strokeWidth={2.5} />
-        </button>
-
-        <button
-          onClick={blockMatchedUser}
-          disabled={actionLoading === 'block'}
-          className="btn-brutal bg-red-100 text-red-700 p-4"
-          title="Block user"
-        >
-          <Ban strokeWidth={2.5} />
-        </button>
-
-        <button
-          data-testid="end-call-btn"
-          onClick={handleEndCall}
-          className="btn-brutal bg-red-500 text-white p-4"
-        >
-          <PhoneOff strokeWidth={2.5} />
-        </button>
-      </div>
     </motion.div>
   );
 };

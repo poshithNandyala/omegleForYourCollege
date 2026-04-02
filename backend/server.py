@@ -334,6 +334,7 @@ active_users = {}  # local-dev fallback only {user_id: sid}
 sid_user_map: Dict[str, str] = {}
 active_calls = {}  # local-dev fallback only
 pending_matches: Dict[str, Dict[str, Any]] = {}  # {user_id: {matched_user_id, call_id, mode, created_at, is_initiator}}
+call_ready_states: Dict[str, set[str]] = {}
 matching_lock = asyncio.Lock()
 in_memory_rate_limits: Dict[str, List[float]] = {}
 
@@ -367,6 +368,10 @@ def user_queue_set_key(user_id: str) -> str:
 
 def pending_match_key(user_id: str) -> str:
     return redis_key("match", "pending", user_id)
+
+
+def call_ready_state_key(call_id: str) -> str:
+    return redis_key("call", "ready", call_id)
 
 
 def online_users_key() -> str:
@@ -681,6 +686,31 @@ async def set_pending_match(user_id: str, data: Dict[str, Any]) -> None:
     )
 
 
+async def mark_call_ready(call_id: str, user_id: str) -> set[str]:
+    if redis_client is None:
+        ready_peers = call_ready_states.setdefault(call_id, set())
+        ready_peers.add(user_id)
+        return set(ready_peers)
+
+    ready_key = call_ready_state_key(call_id)
+    await redis_client.sadd(ready_key, user_id)
+    await redis_client.expire(ready_key, MATCH_PENDING_TTL_SECONDS)
+    raw_members = await redis_client.smembers(ready_key)
+    return {
+        member.decode("utf-8") if isinstance(member, bytes) else member
+        for member in raw_members
+    }
+
+
+async def clear_call_ready_state(call_id: Optional[str]) -> None:
+    if not call_id:
+        return
+    if redis_client is None:
+        call_ready_states.pop(call_id, None)
+        return
+    await redis_client.delete(call_ready_state_key(call_id))
+
+
 async def discard_pending_match(user_id: str) -> Optional[Dict[str, Any]]:
     if redis_client is None:
         return discard_pending_match_locked(user_id)
@@ -800,36 +830,62 @@ def get_request_ip(request: Request) -> str:
     return "unknown"
 
 
+def dedupe_preserve_order(values: List[str]) -> List[str]:
+    seen = set()
+    ordered: List[str] = []
+    for value in values:
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        ordered.append(value)
+    return ordered
+
+
+def derive_same_network_buckets(
+    request: Request,
+    wifi_identifier: Optional[str] = None,
+    network_fingerprint: Optional[str] = None,
+) -> List[str]:
+    if ALLOW_WIFI_IDENTIFIER_OVERRIDE and wifi_identifier:
+        return [f"custom:{wifi_identifier.strip().lower()}"]
+
+    client_ip = get_request_ip(request)
+    buckets: List[str] = []
+    normalized_fingerprint = network_fingerprint.strip().lower() if network_fingerprint else None
+
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        buckets.append(f"ip:{client_ip}")
+        if normalized_fingerprint:
+            buckets.append(f"fingerprint:{normalized_fingerprint}")
+        return dedupe_preserve_order(buckets)
+
+    if isinstance(address, ipaddress.IPv4Address):
+        if not address.is_private and not address.is_loopback:
+            buckets.append(f"ipv4-host:{address.compressed}")
+        prefixes = [24] if (address.is_private or address.is_loopback) else [32, 24]
+    else:
+        prefixes = [64, 56] if (address.is_private or address.is_link_local or address.is_loopback) else [64, 56, 48]
+
+    for prefix in prefixes:
+        network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
+        family = "ipv4" if isinstance(address, ipaddress.IPv4Address) else "ipv6"
+        buckets.append(f"{family}:{network.network_address}/{network.prefixlen}")
+
+    if normalized_fingerprint:
+        buckets.append(f"fingerprint:{normalized_fingerprint}")
+
+    return dedupe_preserve_order(buckets)
+
+
 def derive_wifi_bucket(
     request: Request,
     wifi_identifier: Optional[str] = None,
     network_fingerprint: Optional[str] = None,
 ) -> str:
-    if ALLOW_WIFI_IDENTIFIER_OVERRIDE and wifi_identifier:
-        return f"custom:{wifi_identifier.strip().lower()}"
-
-    client_ip = get_request_ip(request)
-    try:
-        address = ipaddress.ip_address(client_ip)
-    except ValueError:
-        return f"ip:{client_ip}"
-
-    if isinstance(address, ipaddress.IPv4Address):
-        prefix = 24 if (address.is_private or address.is_loopback) else 24
-    else:
-        prefix = 64 if (address.is_private or address.is_link_local or address.is_loopback) else 56
-
-    network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
-    request_bucket = f"{network.network_address}/{network.prefixlen}"
-
-    if network_fingerprint and (
-        address.is_private
-        or address.is_loopback
-        or (isinstance(address, ipaddress.IPv6Address) and address.is_link_local)
-    ):
-        return f"{request_bucket}:{network_fingerprint.strip().lower()}"
-
-    return request_bucket
+    buckets = derive_same_network_buckets(request, wifi_identifier, network_fingerprint)
+    return buckets[0] if buckets else "unknown"
 
 
 def build_ice_servers() -> List[Dict[str, Any]]:
@@ -1802,18 +1858,24 @@ async def find_match(data: ConnectRequest, request: Request):
             await remove_user_from_queues(user_id)
 
             network_bucket: Optional[str] = None
+            network_buckets: List[str] = []
+            network_queue_names: List[str] = []
+            matched_network_bucket: Optional[str] = None
             matched_waiter: Optional[Dict[str, Any]] = None
             queue_name: Optional[str] = None
 
             if data.mode == "same_college":
                 queue_name = queue_key_for("same_college", college)
             elif data.mode == "same_wifi":
-                network_bucket = derive_wifi_bucket(
+                network_buckets = derive_same_network_buckets(
                     request,
                     data.wifi_identifier,
                     data.network_fingerprint,
                 )
-                queue_name = queue_key_for("same_wifi", network_bucket)
+                if not network_buckets:
+                    network_buckets = ["unknown"]
+                network_bucket = network_buckets[0]
+                network_queue_names = [queue_key_for("same_wifi", bucket) for bucket in network_buckets]
             else:
                 queue_name = queue_key_for("cross_college")
 
@@ -1825,6 +1887,12 @@ async def find_match(data: ConnectRequest, request: Request):
                             user_id,
                             current_college=college,
                         )
+                    elif data.mode == "same_wifi":
+                        for index, candidate_queue_name in enumerate(network_queue_names):
+                            matched_waiter = await pop_next_waiter_shared(candidate_queue_name, user_id)
+                            if matched_waiter:
+                                matched_network_bucket = network_buckets[index]
+                                break
                     else:
                         matched_waiter = await pop_next_waiter_shared(queue_name, user_id)
                 else:
@@ -1832,8 +1900,12 @@ async def find_match(data: ConnectRequest, request: Request):
                         queue = matching_queues["same_college"].setdefault(college, [])
                         matched_waiter = pop_next_waiter(queue, user_id)
                     elif data.mode == "same_wifi":
-                        queue = matching_queues["same_wifi"].setdefault(network_bucket, [])
-                        matched_waiter = pop_next_waiter(queue, user_id)
+                        for candidate_bucket in network_buckets:
+                            queue = matching_queues["same_wifi"].setdefault(candidate_bucket, [])
+                            matched_waiter = pop_next_waiter(queue, user_id)
+                            if matched_waiter:
+                                matched_network_bucket = candidate_bucket
+                                break
                     else:
                         queue = matching_queues["cross_college"]
                         matched_waiter = pop_next_waiter(queue, user_id, current_college=college)
@@ -1843,18 +1915,24 @@ async def find_match(data: ConnectRequest, request: Request):
                 if await are_users_blocked(user_id, matched_waiter["user_id"]):
                     matched_waiter = None
                     continue
+                await remove_user_from_queues(matched_waiter["user_id"])
                 break
 
             if not matched_waiter:
                 if redis_client is not None:
                     metadata = {"college": college} if data.mode == "cross_college" else {}
-                    await enqueue_waiter_shared(queue_name, user_id, **metadata)
+                    if data.mode == "same_wifi":
+                        for candidate_queue_name in network_queue_names:
+                            await enqueue_waiter_shared(candidate_queue_name, user_id)
+                    else:
+                        await enqueue_waiter_shared(queue_name, user_id, **metadata)
                 elif data.mode == "same_college":
                     queue = matching_queues["same_college"].setdefault(college, [])
                     enqueue_waiter(queue, user_id)
                 elif data.mode == "same_wifi":
-                    queue = matching_queues["same_wifi"].setdefault(network_bucket, [])
-                    enqueue_waiter(queue, user_id)
+                    for candidate_bucket in network_buckets:
+                        queue = matching_queues["same_wifi"].setdefault(candidate_bucket, [])
+                        enqueue_waiter(queue, user_id)
                 else:
                     queue = matching_queues["cross_college"]
                     enqueue_waiter(queue, user_id, college=college)
@@ -1867,7 +1945,7 @@ async def find_match(data: ConnectRequest, request: Request):
                         "participants": [user_id, matched_waiter["user_id"]],
                         "mode": data.mode,
                         "status": "matched",
-                        "same_wifi_bucket": network_bucket,
+                        "same_wifi_bucket": matched_network_bucket or network_bucket,
                         "created_at": utcnow(),
                     }
                 )
@@ -2211,15 +2289,33 @@ async def call_ready(sid, data):
         return
 
     target_id = data.get("target_id")
-    if not target_id:
+    call_id = data.get("call_id")
+    if not target_id or not call_id:
         return
     if await are_users_blocked(user_id, target_id):
         await sio.emit("error", {"detail": "You cannot connect to this user."}, to=sid)
         return
 
+    call = await db.call_history.find_one(
+        {"call_id": call_id},
+        {"participants": 1, "_id": 0},
+    )
+    participants = call.get("participants", []) if call else []
+    if user_id not in participants or target_id not in participants:
+        await sio.emit("error", {"detail": "Call session is no longer valid."}, to=sid)
+        return
+
+    ready_peers = await mark_call_ready(call_id, user_id)
+    if target_id not in ready_peers:
+        return
+
+    await sio.emit("call_ready", {
+        "from_id": target_id,
+        "call_id": call_id,
+    }, room=user_room(user_id))
     await sio.emit("call_ready", {
         "from_id": user_id,
-        "call_id": data.get("call_id"),
+        "call_id": call_id,
     }, room=user_room(target_id))
 
 @sio.event
@@ -2350,6 +2446,7 @@ async def friend_call_decline(sid, data):
         {"call_id": call_id},
         {"$set": {"status": "declined", "ended_at": utcnow()}},
     )
+    await clear_call_ready_state(call_id)
     await sio.emit(
         "friend_call_declined",
         {"from_id": user_id, "call_id": call_id},
@@ -2444,6 +2541,7 @@ async def end_call(sid, data):
                 "duration": data.get("duration", 0)
             }}
         )
+        await clear_call_ready_state(call_id)
     
     if target_id:
         await sio.emit("call_ended", {
@@ -2512,7 +2610,7 @@ async def health_check():
         "timestamp": utcnow().isoformat(),
         "online_users": online_count,
         "environment": APP_ENV,
-        "same_wifi_strategy": "request_ip_plus_browser_fingerprint",
+        "same_wifi_strategy": "multi_bucket_ip_plus_browser_fingerprint",
         "turn_enabled": TURN_ENABLED,
         "turn_required": turn_required(),
         "database_connected": db_connected,
