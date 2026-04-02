@@ -8,7 +8,7 @@ import {
   MessageSquare, UserPlus, History, Settings, LogOut,
   Wifi, Building2, Globe, Heart, Briefcase, BookOpen,
   Sparkles, Send, X, Check, Loader2, ChevronRight,
-  ShieldAlert, Ban, Flag
+  ShieldAlert, Ban, Flag, Bell, Radio
 } from 'lucide-react';
 
 const trimTrailingSlash = (value) => value.replace(/\/+$/, '');
@@ -25,6 +25,7 @@ const resolveDefaultApiUrl = () => {
 const API_URL = trimTrailingSlash(process.env.REACT_APP_BACKEND_URL || resolveDefaultApiUrl());
 const MATCH_POLL_INTERVAL_MS = 3000;
 const MATCH_WAIT_TIMEOUT_MS = 60000;
+const SOCKET_URL = API_URL.replace('https://', 'wss://').replace('http://', 'ws://');
 const DEFAULT_ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
@@ -96,6 +97,35 @@ const extractPrivateSubnet = (candidateString) => {
   return null;
 };
 
+const extractPrivateIpv6Prefix = (candidateString) => {
+  const matches = candidateString.match(/\b(?:[a-f0-9]{0,4}:){2,7}[a-f0-9]{0,4}\b/gi);
+  if (!matches) {
+    return null;
+  }
+
+  for (const candidate of matches) {
+    const normalized = candidate.toLowerCase();
+    if (normalized.startsWith('fe80:') || normalized.startsWith('fc') || normalized.startsWith('fd')) {
+      return normalized.split(':').slice(0, 4).join(':');
+    }
+  }
+
+  return null;
+};
+
+const extractLocalNetworkSignature = (source) => {
+  if (!source) {
+    return null;
+  }
+
+  const ipv4Subnet = extractPrivateSubnet(source);
+  if (ipv4Subnet) {
+    return ipv4Subnet;
+  }
+
+  return extractPrivateIpv6Prefix(source);
+};
+
 const deriveSameNetworkFingerprint = async () => {
   if (typeof window === 'undefined' || typeof RTCPeerConnection === 'undefined') {
     return null;
@@ -134,16 +164,24 @@ const deriveSameNetworkFingerprint = async () => {
 
     const timeoutId = window.setTimeout(() => {
       void finish(detectedSubnet);
-    }, 1500);
+    }, 3500);
 
     peerConnection.createDataChannel('campuslink-network-probe');
     peerConnection.onicecandidate = (event) => {
       if (!event.candidate) {
+        const sdpSubnet = extractLocalNetworkSignature(peerConnection.localDescription?.sdp || '');
+        if (!detectedSubnet && sdpSubnet) {
+          detectedSubnet = sdpSubnet;
+        }
         void finish(detectedSubnet);
         return;
       }
 
-      const subnet = extractPrivateSubnet(event.candidate.candidate || '');
+      const candidate = event.candidate;
+      const subnet =
+        extractLocalNetworkSignature(candidate.address || '') ||
+        extractLocalNetworkSignature(candidate.relatedAddress || '') ||
+        extractLocalNetworkSignature(candidate.candidate || '');
       if (subnet) {
         detectedSubnet = subnet;
         void finish(subnet);
@@ -857,6 +895,13 @@ const Dashboard = () => {
   const navigate = useNavigate();
   const [activeTab, setActiveTab] = useState('connect');
   const [stats, setStats] = useState({ online_users: 0, total_calls: 0 });
+  const [realtimeReady, setRealtimeReady] = useState(false);
+  const [dashboardNotice, setDashboardNotice] = useState('');
+  const [incomingFriendCall, setIncomingFriendCall] = useState(null);
+  const [outgoingFriendCall, setOutgoingFriendCall] = useState(null);
+  const [friendCallSession, setFriendCallSession] = useState(null);
+  const appSocketRef = useRef(null);
+  const outgoingFriendCallRef = useRef(null);
 
   useEffect(() => {
     const fetchStats = async () => {
@@ -870,12 +915,172 @@ const Dashboard = () => {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    outgoingFriendCallRef.current = outgoingFriendCall;
+  }, [outgoingFriendCall]);
+
+  useEffect(() => {
+    if (!user) {
+      return undefined;
+    }
+
+    const socket = io(SOCKET_URL, {
+      transports: ['websocket'],
+      withCredentials: true,
+      reconnection: true,
+      reconnectionAttempts: 8,
+      reconnectionDelay: 1000,
+    });
+    appSocketRef.current = socket;
+
+    const registerSocketUser = () => {
+      const accessToken = localStorage.getItem('access_token');
+      if (!accessToken) {
+        setDashboardNotice('Your session expired. Please sign in again.');
+        return;
+      }
+
+      socket.emit('register_user', {
+        user_id: user.user_id,
+        access_token: accessToken,
+      });
+    };
+
+    socket.on('connect', registerSocketUser);
+    socket.on('registered', () => {
+      setRealtimeReady(true);
+    });
+    socket.on('disconnect', () => {
+      setRealtimeReady(false);
+    });
+    socket.on('error', (data) => {
+      if (data?.detail) {
+        setDashboardNotice(data.detail);
+      }
+    });
+    socket.on('friend_call_invite', (data) => {
+      setIncomingFriendCall(data);
+      setActiveTab('friends');
+      setDashboardNotice(`${data?.caller?.name || 'A friend'} is calling you.`);
+    });
+    socket.on('friend_call_invite_sent', (data) => {
+      if (outgoingFriendCallRef.current?.callId === data?.call_id) {
+        setOutgoingFriendCall((previous) => previous ? { ...previous, status: 'ringing' } : previous);
+      }
+    });
+    socket.on('friend_call_accepted', (data) => {
+      const acceptedFriend = data?.callee || outgoingFriendCallRef.current?.friend;
+      if (!acceptedFriend) {
+        return;
+      }
+      setFriendCallSession({
+        matchedUser: acceptedFriend,
+        callId: data.call_id,
+        mode: 'friend',
+        isInitiator: true,
+      });
+      setOutgoingFriendCall(null);
+      setIncomingFriendCall(null);
+      setDashboardNotice('');
+    });
+    socket.on('friend_call_declined', (data) => {
+      if (outgoingFriendCallRef.current?.callId === data?.call_id) {
+        setOutgoingFriendCall(null);
+        setDashboardNotice('Friend call declined.');
+      }
+    });
+
+    if (socket.connected) {
+      registerSocketUser();
+    }
+
+    return () => {
+      socket.disconnect();
+      appSocketRef.current = null;
+      setRealtimeReady(false);
+    };
+  }, [user]);
+
+  const startFriendCall = (friend) => {
+    if (!appSocketRef.current || !realtimeReady) {
+      setDashboardNotice('Realtime connection is not ready yet. Please wait a moment and try again.');
+      return;
+    }
+
+    const callId = `call_${Math.random().toString(16).slice(2, 14)}`;
+    setOutgoingFriendCall({ friend, callId, status: 'dialing' });
+    setDashboardNotice(`Calling ${friend.name}...`);
+    appSocketRef.current.emit('friend_call_invite', {
+      target_id: friend.user_id,
+      call_id: callId,
+    });
+  };
+
+  const acceptFriendCall = () => {
+    if (!incomingFriendCall || !appSocketRef.current) {
+      return;
+    }
+
+    appSocketRef.current.emit('friend_call_accept', {
+      target_id: incomingFriendCall.from_id,
+      call_id: incomingFriendCall.call_id,
+    });
+    setFriendCallSession({
+      matchedUser: incomingFriendCall.caller,
+      callId: incomingFriendCall.call_id,
+      mode: 'friend',
+      isInitiator: false,
+    });
+    setIncomingFriendCall(null);
+    setOutgoingFriendCall(null);
+    setDashboardNotice('');
+  };
+
+  const declineFriendCall = () => {
+    if (!incomingFriendCall || !appSocketRef.current) {
+      return;
+    }
+
+    appSocketRef.current.emit('friend_call_decline', {
+      target_id: incomingFriendCall.from_id,
+      call_id: incomingFriendCall.call_id,
+    });
+    setDashboardNotice('Friend call declined.');
+    setIncomingFriendCall(null);
+  };
+
+  const endFriendCall = () => {
+    setFriendCallSession(null);
+  };
+
   const tabs = [
     { id: 'connect', label: 'Connect', icon: Video },
     { id: 'friends', label: 'Friends', icon: Users },
     { id: 'history', label: 'History', icon: History },
     { id: 'profile', label: 'Profile', icon: Settings },
   ];
+
+  if (friendCallSession) {
+    return (
+      <div className="min-h-screen bg-background">
+        <header className="bg-surface border-b-2 border-border p-4">
+          <div className="max-w-7xl mx-auto flex items-center justify-between">
+            <h1 className="font-heading text-2xl font-black">CampusLink</h1>
+            <span className="font-bold text-sm text-text-secondary">Friend call in progress</span>
+          </div>
+        </header>
+        <div className="max-w-7xl mx-auto p-6">
+          <VideoCall
+            matchedUser={friendCallSession.matchedUser}
+            callId={friendCallSession.callId}
+            mode={friendCallSession.mode}
+            isInitiator={friendCallSession.isInitiator}
+            onEndCall={endFriendCall}
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-background">
@@ -908,6 +1113,43 @@ const Dashboard = () => {
       </header>
 
       <div className="max-w-7xl mx-auto p-6">
+        {dashboardNotice && (
+          <div className="mb-6 border-2 border-border bg-accent-yellow px-4 py-3 shadow-brutal">
+            <p className="font-bold">{dashboardNotice}</p>
+          </div>
+        )}
+
+        {incomingFriendCall && (
+          <div className="mb-6 border-2 border-border bg-surface px-5 py-5 shadow-brutal">
+            <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+              <div>
+                <p className="text-xs font-bold uppercase tracking-widest text-text-secondary">Incoming Friend Call</p>
+                <h2 className="font-heading text-2xl font-black">{incomingFriendCall.caller?.name} is calling</h2>
+                <p className="text-text-secondary">{incomingFriendCall.caller?.college}</p>
+              </div>
+              <div className="flex gap-3">
+                <button onClick={acceptFriendCall} className="btn-primary">
+                  Accept Call
+                </button>
+                <button onClick={declineFriendCall} className="btn-brutal bg-surface">
+                  Decline
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {outgoingFriendCall && (
+          <div className="mb-6 border-2 border-border bg-accent-lilac px-4 py-3 shadow-brutal">
+            <p className="font-bold">
+              Calling {outgoingFriendCall.friend.name}...
+              <span className="ml-2 text-sm text-text-secondary">
+                {outgoingFriendCall.status === 'ringing' ? 'Waiting for them to accept.' : 'Sending invite.'}
+              </span>
+            </p>
+          </div>
+        )}
+
         {/* Tabs */}
         <div className="flex gap-2 mb-8 overflow-x-auto">
           {tabs.map((tab) => (
@@ -927,7 +1169,14 @@ const Dashboard = () => {
         {/* Tab Content */}
         <AnimatePresence mode="wait">
           {activeTab === 'connect' && <ConnectTab key="connect" />}
-          {activeTab === 'friends' && <FriendsTab key="friends" />}
+          {activeTab === 'friends' && (
+            <FriendsTab
+              key="friends"
+              onStartFriendCall={startFriendCall}
+              realtimeReady={realtimeReady}
+              outgoingFriendCall={outgoingFriendCall}
+            />
+          )}
           {activeTab === 'history' && <HistoryTab key="history" />}
           {activeTab === 'profile' && <ProfileTab key="profile" />}
         </AnimatePresence>
@@ -1170,7 +1419,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
   const { user } = useAuth();
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
-  const [chatOpen, setChatOpen] = useState(false);
+  const [chatOpen, setChatOpen] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 1024);
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
   const [iceBreakers, setIceBreakers] = useState([]);
@@ -1180,6 +1429,9 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
   const [reportReason, setReportReason] = useState('harassment');
   const [reportDetails, setReportDetails] = useState('');
   const [actionLoading, setActionLoading] = useState('');
+  const [callStatus, setCallStatus] = useState('Preparing secure call...');
+  const [remoteVideoReady, setRemoteVideoReady] = useState(false);
+  const [unreadMessages, setUnreadMessages] = useState(0);
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const peerConnectionRef = useRef(null);
@@ -1234,24 +1486,17 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         remoteReadyRef.current = false;
         offerStartedRef.current = false;
         socketRegisteredRef.current = false;
+        setCallStatus('Connecting to live call...');
+        setRemoteVideoReady(false);
 
-        // Get local media
-        const stream = await navigator.mediaDevices.getUserMedia({
+        const mediaPromise = navigator.mediaDevices.getUserMedia({
           video: true,
           audio: true
         });
-        if (!isMounted) {
-          stream.getTracks().forEach(track => track.stop());
-          return;
-        }
-        localStreamRef.current = stream;
-        if (localVideoRef.current) {
-          localVideoRef.current.srcObject = stream;
-        }
+        const rtcConfigPromise = getRtcConfig();
 
         // Setup Socket.IO
-        const wsUrl = API_URL.replace('https://', 'wss://').replace('http://', 'ws://');
-        socketRef.current = io(wsUrl, {
+        socketRef.current = io(SOCKET_URL, {
           transports: ['websocket'],
           withCredentials: true,
           reconnection: true,
@@ -1333,13 +1578,22 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         await registrationPromise;
 
-        const rtcConfig = await getRtcConfig();
+        const [stream, rtcConfig] = await Promise.all([mediaPromise, rtcConfigPromise]);
+        if (!isMounted) {
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+        localStreamRef.current = stream;
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = stream;
+        }
         if (rtcConfig.turn_required && !rtcConfig.turn_enabled) {
           throw new Error('TURN relay is required before calls can start in production.');
         }
 
         peerConnectionRef.current = new RTCPeerConnection({
-          iceServers: rtcConfig.ice_servers
+          iceServers: rtcConfig.ice_servers,
+          iceCandidatePoolSize: 10,
         });
 
         // Add local tracks
@@ -1351,6 +1605,30 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         peerConnectionRef.current.ontrack = (event) => {
           if (remoteVideoRef.current && event.streams[0]) {
             remoteVideoRef.current.srcObject = event.streams[0];
+            setRemoteVideoReady(true);
+            setCallStatus('Connected');
+          }
+        };
+
+        peerConnectionRef.current.onconnectionstatechange = () => {
+          const state = peerConnectionRef.current?.connectionState;
+          if (state === 'connected') {
+            setCallStatus('Connected');
+          } else if (state === 'connecting') {
+            setCallStatus('Connecting video...');
+          } else if (state === 'failed') {
+            setCallStatus('Connection failed. Trying to recover...');
+          } else if (state === 'disconnected') {
+            setCallStatus('Connection interrupted...');
+          }
+        };
+
+        peerConnectionRef.current.oniceconnectionstatechange = () => {
+          const iceState = peerConnectionRef.current?.iceConnectionState;
+          if (iceState === 'checking') {
+            setCallStatus('Checking network route...');
+          } else if (iceState === 'connected' || iceState === 'completed') {
+            setCallStatus('Connected');
           }
         };
 
@@ -1392,6 +1670,9 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         // Handle chat messages
         socketRef.current.on('chat_message', (data) => {
           setMessages(prev => [...prev, { from: 'them', text: data.message }]);
+          if (!chatOpen) {
+            setUnreadMessages(prev => prev + 1);
+          }
         });
 
         socketRef.current.on('call_ready', async (data) => {
@@ -1529,7 +1810,8 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
   const modeColors = {
     same_college: 'bg-accent-mint',
     same_wifi: 'bg-accent-yellow',
-    cross_college: 'bg-accent-lilac'
+    cross_college: 'bg-accent-lilac',
+    friend: 'bg-primary/40'
   };
 
   return (
@@ -1564,6 +1846,20 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             <span className="font-bold">{matchedUser.name}</span>
             <span className="text-text-secondary text-sm ml-2">{matchedUser.college}</span>
           </div>
+          <div className="absolute top-4 left-4 bg-black/55 text-white border border-white/20 px-3 py-2 backdrop-blur-md">
+            <div className="flex items-center gap-2 text-sm font-bold">
+              <Radio className="w-4 h-4" strokeWidth={2.5} />
+              {callStatus}
+            </div>
+          </div>
+          {!remoteVideoReady && (
+            <div className="absolute inset-0 bg-black/35 backdrop-blur-[2px] flex items-center justify-center">
+              <div className="bg-surface/85 border-2 border-border px-6 py-4 shadow-brutal text-center">
+                <p className="font-heading text-lg font-bold mb-1">Getting {matchedUser.name}'s video ready</p>
+                <p className="text-sm text-text-secondary">{callStatus}</p>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Local Video */}
@@ -1581,15 +1877,38 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         </div>
       </div>
 
+      {!chatOpen && (
+        <button
+          onClick={() => {
+            setChatOpen(true);
+            setUnreadMessages(0);
+          }}
+          className="absolute right-6 top-24 z-10 border-2 border-border bg-surface/80 backdrop-blur-xl px-4 py-3 shadow-brutal"
+        >
+          <span className="flex items-center gap-2 font-bold">
+            <Bell className="w-4 h-4" strokeWidth={2.5} />
+            Open Chat
+            {unreadMessages > 0 && (
+              <span className="min-w-[24px] rounded-full bg-primary px-2 py-0.5 text-xs text-text-primary">
+                {unreadMessages}
+              </span>
+            )}
+          </span>
+        </button>
+      )}
+
       {/* Chat Sidebar */}
       {chatOpen && (
         <motion.div
           initial={{ x: 300, opacity: 0 }}
           animate={{ x: 0, opacity: 1 }}
-          className="w-80 card-brutal flex flex-col"
+          className="absolute right-6 top-24 bottom-24 z-10 w-96 border-2 border-border bg-surface/78 backdrop-blur-xl shadow-brutal flex flex-col p-5"
         >
           <div className="flex justify-between items-center mb-4">
-            <h3 className="font-heading font-bold">Chat</h3>
+            <div>
+              <h3 className="font-heading font-bold text-xl">Live Chat</h3>
+              <p className="text-sm text-text-secondary">Keep the conversation going while the call connects.</p>
+            </div>
             <button onClick={() => setChatOpen(false)}>
               <X strokeWidth={2.5} />
             </button>
@@ -1614,11 +1933,11 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           )}
 
           {/* Messages */}
-          <div className="flex-1 overflow-y-auto space-y-2 mb-4">
+          <div className="flex-1 overflow-y-auto space-y-3 mb-4 pr-1">
             {messages.map((msg, i) => (
               <div
                 key={i}
-                className={`p-3 border-2 border-border ${msg.from === 'me' ? 'bg-primary ml-4' : 'bg-surface mr-4'
+                className={`p-3 border-2 border-border shadow-sm ${msg.from === 'me' ? 'bg-primary/90 ml-8' : 'bg-white/65 mr-8'
                   }`}
               >
                 {msg.text}
@@ -1715,10 +2034,21 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         <button
           data-testid="chat-btn"
-          onClick={() => setChatOpen(!chatOpen)}
-          className={`btn-brutal p-4 ${chatOpen ? 'bg-secondary text-white' : 'bg-surface'}`}
+          onClick={() => {
+            setChatOpen(!chatOpen);
+            setUnreadMessages(0);
+          }}
+          className={`btn-brutal px-4 py-4 ${chatOpen ? 'bg-secondary text-white' : 'bg-surface'}`}
         >
-          <MessageSquare strokeWidth={2.5} />
+          <span className="flex items-center gap-2">
+            <MessageSquare strokeWidth={2.5} />
+            <span className="hidden md:inline">Chat</span>
+            {unreadMessages > 0 && (
+              <span className="rounded-full bg-primary px-2 py-0.5 text-xs text-text-primary">
+                {unreadMessages}
+              </span>
+            )}
+          </span>
         </button>
 
         <button
@@ -1759,9 +2089,28 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 };
 
 // Friends Tab
-const FriendsTab = () => {
+const FriendsTab = ({ onStartFriendCall, realtimeReady, outgoingFriendCall }) => {
   const [friends, setFriends] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [chatFriend, setChatFriend] = useState(null);
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatDraft, setChatDraft] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const [chatSending, setChatSending] = useState(false);
+  const [chatError, setChatError] = useState('');
+
+  const loadFriendMessages = useCallback(async (friendId, preserveScroll = false) => {
+    setChatLoading(!preserveScroll);
+    setChatError('');
+    try {
+      const { data } = await axios.get(`/api/friends/messages/${friendId}`);
+      setChatMessages(data.messages || []);
+    } catch (error) {
+      setChatError(getErrorMessage(error, 'Could not load this friend chat.'));
+    } finally {
+      setChatLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     const fetchFriends = async () => {
@@ -1776,6 +2125,45 @@ const FriendsTab = () => {
     };
     fetchFriends();
   }, []);
+
+  useEffect(() => {
+    if (!chatFriend) {
+      return undefined;
+    }
+
+    loadFriendMessages(chatFriend.user_id);
+    const interval = setInterval(() => {
+      loadFriendMessages(chatFriend.user_id, true);
+    }, 4000);
+
+    return () => clearInterval(interval);
+  }, [chatFriend, loadFriendMessages]);
+
+  const openFriendChat = (friend) => {
+    setChatFriend(friend);
+    setChatDraft('');
+  };
+
+  const sendFriendMessage = async () => {
+    if (!chatFriend || !chatDraft.trim()) {
+      return;
+    }
+
+    setChatSending(true);
+    setChatError('');
+    try {
+      await axios.post('/api/friends/messages', {
+        receiver_id: chatFriend.user_id,
+        content: chatDraft.trim(),
+      });
+      setChatDraft('');
+      await loadFriendMessages(chatFriend.user_id, true);
+    } catch (error) {
+      setChatError(getErrorMessage(error, 'Could not send your message.'));
+    } finally {
+      setChatSending(false);
+    }
+  };
 
   if (loading) {
     return (
@@ -1824,15 +2212,112 @@ const FriendsTab = () => {
               </div>
 
               <div className="mt-4 flex gap-2">
-                <button className="btn-primary flex-1 !py-2 text-sm">
+                <button
+                  onClick={() => onStartFriendCall(friend)}
+                  disabled={!realtimeReady}
+                  className="btn-primary flex-1 !py-2 text-sm disabled:opacity-60"
+                >
                   <Video className="w-4 h-4 inline mr-1" strokeWidth={2.5} /> Call
                 </button>
-                <button className="btn-brutal bg-surface !py-2 text-sm">
+                <button
+                  onClick={() => openFriendChat(friend)}
+                  className="btn-brutal bg-surface !py-2 text-sm"
+                >
                   <MessageSquare className="w-4 h-4 inline mr-1" strokeWidth={2.5} /> Chat
                 </button>
               </div>
+
+              {outgoingFriendCall?.friend?.user_id === friend.user_id && (
+                <p className="mt-3 text-sm font-bold text-text-secondary">
+                  {outgoingFriendCall.status === 'ringing' ? 'Ringing...' : 'Starting call...'}
+                </p>
+              )}
             </div>
           ))}
+        </div>
+      )}
+
+      {!realtimeReady && (
+        <div className="mt-6 border-2 border-border bg-accent-yellow px-4 py-3 shadow-brutal">
+          Friend calling is still connecting to realtime services. Wait a few seconds and try again.
+        </div>
+      )}
+
+      {chatFriend && (
+        <div className="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm p-4 md:p-8">
+          <div className="mx-auto flex h-full max-w-2xl flex-col border-2 border-border bg-surface shadow-brutal">
+            <div className="flex items-center justify-between border-b-2 border-border px-5 py-4">
+              <div>
+                <h3 className="font-heading text-2xl font-black">{chatFriend.name}</h3>
+                <p className="text-sm text-text-secondary">{chatFriend.college}</p>
+              </div>
+              <button onClick={() => setChatFriend(null)} className="btn-brutal bg-surface !p-3">
+                <X strokeWidth={2.5} />
+              </button>
+            </div>
+
+            {chatError && (
+              <div className="m-4 border-2 border-red-500 bg-red-100 px-4 py-3 text-red-700">
+                {chatError}
+              </div>
+            )}
+
+            <div className="flex-1 overflow-y-auto bg-background/60 px-5 py-5">
+              {chatLoading ? (
+                <div className="flex justify-center py-10">
+                  <Loader2 className="w-8 h-8 animate-spin text-primary" />
+                </div>
+              ) : chatMessages.length === 0 ? (
+                <div className="border-2 border-dashed border-border bg-white/60 px-6 py-10 text-center">
+                  <p className="font-bold">No messages yet</p>
+                  <p className="text-sm text-text-secondary">Start the conversation with your friend here.</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {chatMessages.map((message) => {
+                    const isMine = message.sender_id !== chatFriend.user_id;
+                    return (
+                      <div
+                        key={message.message_id}
+                        className={`max-w-[80%] border-2 border-border px-4 py-3 shadow-sm ${
+                          isMine ? 'ml-auto bg-primary/90' : 'bg-white/75'
+                        }`}
+                      >
+                        <p>{message.content}</p>
+                        <p className="mt-2 text-xs text-text-secondary">
+                          {new Date(message.created_at).toLocaleString()}
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            <div className="border-t-2 border-border bg-surface/90 px-5 py-4">
+              <div className="flex gap-3">
+                <textarea
+                  value={chatDraft}
+                  onChange={(event) => setChatDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && !event.shiftKey) {
+                      event.preventDefault();
+                      void sendFriendMessage();
+                    }
+                  }}
+                  className="input-brutal min-h-[88px] flex-1"
+                  placeholder={`Message ${chatFriend.name}...`}
+                />
+                <button
+                  onClick={sendFriendMessage}
+                  disabled={chatSending}
+                  className="btn-primary self-end"
+                >
+                  {chatSending ? 'Sending...' : 'Send'}
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </motion.div>
@@ -1861,7 +2346,8 @@ const HistoryTab = () => {
   const modeLabels = {
     same_college: { label: 'Same College', color: 'bg-accent-mint' },
     same_wifi: { label: 'Same Network', color: 'bg-accent-yellow' },
-    cross_college: { label: 'Cross College', color: 'bg-accent-lilac' }
+    cross_college: { label: 'Cross College', color: 'bg-accent-lilac' },
+    friend: { label: 'Friend Call', color: 'bg-primary/40' }
   };
 
   if (loading) {

@@ -142,7 +142,9 @@ RATE_LIMITS = {
     "match_cancel": (30, 60),
     "report_create": (10, 60 * 60),
     "block_create": (30, 60 * 60),
+    "friend_message": (60, 60),
     "socket_register": (10, 60),
+    "socket_friend_call": (20, 60),
     "socket_offer": (20, 60),
     "socket_answer": (20, 60),
     "socket_ice": (300, 60),
@@ -511,6 +513,17 @@ async def enforce_not_blocked(user_id: str, other_user_id: str) -> None:
         raise HTTPException(status_code=403, detail="This interaction is unavailable due to a block.")
 
 
+async def are_friends(user_id: str, other_user_id: str) -> bool:
+    if db is None:
+        return False
+
+    friendship = await db.friends.find_one(
+        {"user_id": user_id, "friend_id": other_user_id},
+        {"_id": 1},
+    )
+    return friendship is not None
+
+
 async def decode_access_token_value(token: str) -> Dict[str, Any]:
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -802,9 +815,9 @@ def derive_wifi_bucket(
         return f"ip:{client_ip}"
 
     if isinstance(address, ipaddress.IPv4Address):
-        prefix = 24 if (address.is_private or address.is_loopback) else 32
+        prefix = 24 if (address.is_private or address.is_loopback) else 24
     else:
-        prefix = 64
+        prefix = 64 if (address.is_private or address.is_link_local or address.is_loopback) else 56
 
     network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
     request_bucket = f"{network.network_address}/{network.prefixlen}"
@@ -1565,6 +1578,75 @@ async def get_friends(request: Request):
     return {"friends": friends}
 
 
+@app.get("/api/friends/messages/{friend_id}")
+async def get_friend_messages(friend_id: str, request: Request):
+    user = await get_current_user(request)
+    await enforce_not_blocked(user["user_id"], friend_id)
+    if not await are_friends(user["user_id"], friend_id):
+        raise HTTPException(status_code=403, detail="You can only view chats with friends.")
+
+    messages = await db.messages.find(
+        {
+            "$or": [
+                {"sender_id": user["user_id"], "receiver_id": friend_id},
+                {"sender_id": friend_id, "receiver_id": user["user_id"]},
+            ]
+        },
+        {"_id": 0},
+    ).sort("created_at", 1).to_list(200)
+
+    return {"messages": messages}
+
+
+@app.post("/api/friends/messages")
+async def send_friend_message(data: MessageSend, request: Request):
+    user = await get_current_user(request)
+    await enforce_rate_limit(
+        f"friend-message:{user['user_id']}",
+        limit_name="friend_message",
+        override_message="Too many messages. Please slow down.",
+    )
+
+    if user["user_id"] == data.receiver_id:
+        raise HTTPException(status_code=400, detail="Cannot message yourself.")
+
+    await enforce_not_blocked(user["user_id"], data.receiver_id)
+    if not await are_friends(user["user_id"], data.receiver_id):
+        raise HTTPException(status_code=403, detail="You can only message friends.")
+
+    message = (data.content or "").strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    moderation_issue = content_is_disallowed(message, field_name="Message")
+    if moderation_issue:
+        await record_moderation_incident(user["user_id"], message, moderation_issue, "friend_message")
+        raise HTTPException(status_code=400, detail=moderation_issue)
+
+    message_doc = {
+        "message_id": f"msg_{uuid.uuid4().hex[:12]}",
+        "sender_id": user["user_id"],
+        "receiver_id": data.receiver_id,
+        "content": message,
+        "created_at": utcnow(),
+    }
+    await db.messages.insert_one(message_doc)
+
+    await sio.emit(
+        "friend_message",
+        {
+            "message_id": message_doc["message_id"],
+            "sender_id": user["user_id"],
+            "receiver_id": data.receiver_id,
+            "content": message,
+            "created_at": message_doc["created_at"].isoformat(),
+        },
+        room=user_room(data.receiver_id),
+    )
+
+    return {"status": "success", "message": message_doc}
+
+
 # ============ SAFETY ENDPOINTS ============
 
 @app.get("/api/safety/blocks")
@@ -2139,6 +2221,141 @@ async def call_ready(sid, data):
         "from_id": user_id,
         "call_id": data.get("call_id"),
     }, room=user_room(target_id))
+
+@sio.event
+async def friend_call_invite(sid, data):
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+    if await socket_rate_limited(
+        sid,
+        f"socket-friend-call:{user_id}",
+        "socket_friend_call",
+        "Too many friend call attempts.",
+    ):
+        return
+
+    target_id = data.get("target_id")
+    if not target_id:
+        return
+    if user_id == target_id:
+        await sio.emit("error", {"detail": "You cannot call yourself."}, to=sid)
+        return
+    if not await are_friends(user_id, target_id):
+        await sio.emit("error", {"detail": "You can only call friends."}, to=sid)
+        return
+    if await are_users_blocked(user_id, target_id):
+        await sio.emit("error", {"detail": "This call is unavailable due to a block."}, to=sid)
+        return
+
+    caller = await db.users.find_one(
+        {"user_id": user_id},
+        {"_id": 0, "password_hash": 0, "email": 0},
+    )
+    if caller is None:
+        await sio.emit("error", {"detail": "Caller not found."}, to=sid)
+        return
+
+    call_id = data.get("call_id") or f"call_{uuid.uuid4().hex[:12]}"
+    await db.call_history.update_one(
+        {"call_id": call_id},
+        {
+            "$setOnInsert": {
+                "call_id": call_id,
+                "participants": [user_id, target_id],
+                "mode": "friend",
+                "created_at": utcnow(),
+            },
+            "$set": {
+                "status": "ringing",
+                "updated_at": utcnow(),
+            },
+        },
+        upsert=True,
+    )
+
+    await sio.emit(
+        "friend_call_invite",
+        {
+            "from_id": user_id,
+            "call_id": call_id,
+            "caller": caller,
+        },
+        room=user_room(target_id),
+    )
+    await sio.emit(
+        "friend_call_invite_sent",
+        {"target_id": target_id, "call_id": call_id},
+        to=sid,
+    )
+
+
+@sio.event
+async def friend_call_accept(sid, data):
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+
+    target_id = data.get("target_id")
+    call_id = data.get("call_id")
+    if not target_id or not call_id:
+        return
+    if not await are_friends(user_id, target_id):
+        await sio.emit("error", {"detail": "You can only call friends."}, to=sid)
+        return
+    if await are_users_blocked(user_id, target_id):
+        await sio.emit("error", {"detail": "This call is unavailable due to a block."}, to=sid)
+        return
+
+    callee = await db.users.find_one(
+        {"user_id": user_id},
+        {"_id": 0, "password_hash": 0, "email": 0},
+    )
+    if callee is None:
+        await sio.emit("error", {"detail": "User not found."}, to=sid)
+        return
+
+    await db.call_history.update_one(
+        {"call_id": call_id},
+        {"$set": {"status": "matched", "updated_at": utcnow()}},
+        upsert=True,
+    )
+
+    await sio.emit(
+        "friend_call_accepted",
+        {
+            "from_id": user_id,
+            "call_id": call_id,
+            "callee": callee,
+        },
+        room=user_room(target_id),
+    )
+
+
+@sio.event
+async def friend_call_decline(sid, data):
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+
+    target_id = data.get("target_id")
+    call_id = data.get("call_id")
+    if not target_id or not call_id:
+        return
+
+    await db.call_history.update_one(
+        {"call_id": call_id},
+        {"$set": {"status": "declined", "ended_at": utcnow()}},
+    )
+    await sio.emit(
+        "friend_call_declined",
+        {"from_id": user_id, "call_id": call_id},
+        room=user_room(target_id),
+    )
+
 
 @sio.event
 async def offer(sid, data):
