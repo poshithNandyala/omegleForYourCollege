@@ -1,0 +1,85 @@
+{
+  "theme": "light",
+  "archetype": "Archetype 3 (Pastel & Soft) mixed with Neo-Brutalism",
+  "design_philosophy": "Fresh, raw, and highly energetic. Breaks the smooth, corporate 'SaaS' mold by utilizing neo-brutalist principles: flat pastel backgrounds, thick stark black borders, hard offset shadows, and bold expressive typography. This perfectly captures the Gen Z college audience's preference for authenticity, fun, and anti-corporate design.",
+  "colors": {
+    "background": "#FFF8E7",
+    "surface": "#FFFFFF",
+    "primary": "#FF49DB",
+    "secondary": "#2563EB",
+    "accent_mint": "#E2F5E9",
+    "accent_lilac": "#EBE4F6",
+    "accent_yellow": "#FFF3C7",
+    "text_primary": "#121212",
+    "text_secondary": "#4A4A4A",
+    "border": "#121212"
+  },
+  "typography": {
+    "heading_font": "Bricolage Grotesque",
+    "body_font": "Outfit",
+    "rules": {
+      "h1": "text-4xl sm:text-5xl lg:text-6xl font-black tracking-tighter text-[#121212]",
+      "h2": "text-2xl sm:text-3xl lg:text-4xl font-extrabold tracking-tight text-[#121212]",
+      "h3": "text-xl sm:text-2xl font-bold tracking-tight text-[#121212]",
+      "body": "text-base font-medium leading-relaxed text-[#4A4A4A]",
+      "labels": "text-xs font-bold uppercase tracking-[0.2em] text-[#121212]"
+    }
+  },
+  "layout_and_spacing": {
+    "grid_strategy": "Tetris Grid for landing/onboarding. Asymmetrical, varied column spans. Dashboard/App uses dense Control Room grid but with hard borders separating panes.",
+    "spacing_scale": "Use generous padding. p-6 or p-8 inside bordered containers. gap-6 to gap-8 between grid items.",
+    "borders_and_shadows": "Neo-Brutalist standard: 2px solid #121212 borders on all interactive elements and containers. Use hard offset shadows instead of soft blurs (e.g., shadow-[4px_4px_0px_#121212]). Hover states increase translation and shadow spread (e.g., -translate-y-1 shadow-[6px_6px_0px_#121212]).",
+    "corners": "Sharp (rounded-none) to emphasize the brutalist, raw structure."
+  },
+  "components": {
+    "buttons": "Thick 2px borders, solid pastel or primary background, high contrast text. Hover must translate X and Y and expand the hard shadow. Example: bg-[#FF49DB] text-[#121212] font-bold border-2 border-[#121212] shadow-[4px_4px_0px_#121212] hover:-translate-y-1 hover:-translate-x-1 hover:shadow-[6px_6px_0px_#121212] transition-all duration-200.",
+    "cards": "Flat surfaces (white or pastel) with 2px black border and offset black shadow. Internal padding p-6.",
+    "inputs": "Large text, thick 2px black border, p-4. focus:outline-none focus:ring-0 focus:border-[#2563EB] focus:shadow-[4px_4px_0px_#2563EB] transition-all.",
+    "video_chat_interface": "The main video grid should be pure and simple. Videos fill their container (object-cover) with a stark 2px black border separating users. Overlay controls use high-contrast solid blocks, NO blurry glassmorphism. Use solid white/black backgrounds for control bars.",
+    "chat_bubbles": "Sharp edges, flat colors. Same college = Yellow, Same WiFi = Mint, Cross College = Lilac.",
+    "shadcn_customization": "Strip all default rounded-md and shadow-sm classes from Shadcn. Replace with rounded-none border-2 border-[#121212] shadow-[4px_4px_0px_#121212]."
+  },
+  "motion": {
+    "strategy": "Snappy, spring-based animations. No slow, floaty fades. When connecting to a peer, use an energetic slide-up or hard scale-in.",
+    "hover": "Translate elements quickly with hard shadows expanding to simulate physical button pressing or lifting."
+  },
+  "accessibility": {
+    "contrast": "Extremely high due to neo-brutalist stark black text/borders against pastel or white backgrounds.",
+    "data_testid": "All interactive and key informational elements MUST include a data-testid attribute (e.g., data-testid='login-submit-button', data-testid='video-toggle')."
+  },
+  "media_and_assets": {
+    "icons": "lucide-react with strokeWidth={2.5} or 3 for a chunky, bold look matching the borders.",
+    "images": [
+      {
+        "category": "hero_background",
+        "url": "https://images.unsplash.com/photo-1767473907132-9e52351d023a?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjY2NzN8MHwxfHNlYXJjaHwxfHxhYnN0cmFjdCUyMGdlb21ldHJpYyUyMHBhc3RlbCUyMGNvbG9yc3xlbnwwfHx8fDE3NzUxMzYxNzJ8MA&ixlib=rb-4.1.0&q=85",
+        "description": "Abstract pastel geometric shapes with soft lighting. Use as an accent background for the landing page or OTP login screen."
+      },
+      {
+        "category": "feature_study_buddy",
+        "url": "https://images.unsplash.com/photo-1686624386665-4cd01b96d0f6?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NTJ8MHwxfHNlYXJjaHwxfHxpbmRpYW4lMjBjb2xsZWdlJTIwc3R1ZGVudHMlMjBmcmllbmRzfGVufDB8fHx8MTc3NTEzNjE1N3ww&ixlib=rb-4.1.0&q=85",
+        "description": "A group of students sitting at a table studying/writing. Use in the Study Buddy matching feature or as an onboarding graphic."
+      },
+      {
+        "category": "feature_networking",
+        "url": "https://images.pexels.com/photos/12807372/pexels-photo-12807372.png?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+        "description": "A group of friends happily posing outdoors. Use for the 'Find Friends' or 'Cross College' networking feature."
+      },
+      {
+        "category": "community_vibe",
+        "url": "https://images.unsplash.com/photo-1722385037149-491a8cfaadc1?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NTJ8MHwxfHNlYXJjaHwyfHxpbmRpYW4lMjBjb2xsZWdlJTIwc3R1ZGVudHMlMjBmcmllbmRzfGVufDB8fHx8MTc3NTEzNjE1N3ww&ixlib=rb-4.1.0&q=85",
+        "description": "A group of people standing around each other. Use for community/history/friends list empty states or banners."
+      }
+    ]
+  },
+  "instructions_to_main_agent": [
+    "Install and use `lucide-react` for chunky icons (strokeWidth={2.5}).",
+    "Override default Shadcn UI classes. Strip `rounded-md`, `shadow-sm`, and soft borders. Replace with `rounded-none`, `border-2 border-[#121212]`, and `shadow-[4px_4px_0px_#121212]`.",
+    "Use raw HTML/Tailwind for the landing page and OTP layout. Use Shadcn strictly for interactive pieces (dialogs, dropdowns, inputs) but heavily restyle them.",
+    "Add Bricolage Grotesque and Outfit from Google Fonts to the index.html or global css.",
+    "For the Video Chat interface, prioritize the video feeds taking up maximum screen real estate. Controls should float in stark, high-contrast flat-colored blocks.",
+    "Implement the 3 connection modes using strong color-coding (Same College = Mint, Same WiFi = Yellow, Cross College = Lilac).",
+    "Include `data-testid` on ALL buttons, inputs, and toggle switches.",
+    "Never use placehold.it or dummyimage. Use ONLY the media URLs provided in this file."
+  ]
+}
