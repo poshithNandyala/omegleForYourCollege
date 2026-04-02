@@ -804,12 +804,16 @@ def derive_wifi_bucket(
     if isinstance(address, ipaddress.IPv4Address):
         prefix = 24 if (address.is_private or address.is_loopback) else 32
     else:
-        prefix = 64 if (address.is_private or address.is_link_local or address.is_loopback) else 128
+        prefix = 64
 
     network = ipaddress.ip_network(f"{address}/{prefix}", strict=False)
     request_bucket = f"{network.network_address}/{network.prefixlen}"
 
-    if network_fingerprint:
+    if network_fingerprint and (
+        address.is_private
+        or address.is_loopback
+        or (isinstance(address, ipaddress.IPv6Address) and address.is_link_local)
+    ):
         return f"{request_bucket}:{network_fingerprint.strip().lower()}"
 
     return request_bucket
@@ -2115,6 +2119,26 @@ async def register_user(sid, data):
         {"$set": {"online": True, "last_seen": utcnow()}}
     )
     await sio.emit("registered", {"status": "ok", "user_id": user_id}, to=sid)
+
+@sio.event
+async def call_ready(sid, data):
+    """Signal that a peer is registered and ready to receive call signaling."""
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+
+    target_id = data.get("target_id")
+    if not target_id:
+        return
+    if await are_users_blocked(user_id, target_id):
+        await sio.emit("error", {"detail": "You cannot connect to this user."}, to=sid)
+        return
+
+    await sio.emit("call_ready", {
+        "from_id": user_id,
+        "call_id": data.get("call_id"),
+    }, room=user_room(target_id))
 
 @sio.event
 async def offer(sid, data):

@@ -1185,6 +1185,9 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
   const peerConnectionRef = useRef(null);
   const socketRef = useRef(null);
   const localStreamRef = useRef(null);
+  const remoteReadyRef = useRef(false);
+  const offerStartedRef = useRef(false);
+  const socketRegisteredRef = useRef(false);
   const reportReasonOptions = [
     { id: 'harassment', label: 'Harassment' },
     { id: 'hate', label: 'Hate speech' },
@@ -1228,6 +1231,10 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
     const setupCall = async () => {
       try {
+        remoteReadyRef.current = false;
+        offerStartedRef.current = false;
+        socketRegisteredRef.current = false;
+
         // Get local media
         const stream = await navigator.mediaDevices.getUserMedia({
           video: true,
@@ -1252,6 +1259,59 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           reconnectionDelay: 1000,
         });
 
+        const waitForSocketRegistration = () =>
+          new Promise((resolve, reject) => {
+            const timeoutId = window.setTimeout(() => {
+              cleanup();
+              reject(new Error('Socket registration timed out.'));
+            }, 10000);
+
+            const cleanup = () => {
+              window.clearTimeout(timeoutId);
+              socketRef.current?.off('registered', handleRegistered);
+              socketRef.current?.off('error', handleSocketError);
+              socketRef.current?.off('disconnect', handleDisconnect);
+            };
+
+            const handleRegistered = () => {
+              socketRegisteredRef.current = true;
+              cleanup();
+              resolve();
+            };
+
+            const handleSocketError = (data) => {
+              const detail = data?.detail || 'Socket registration failed.';
+              cleanup();
+              reject(new Error(detail));
+            };
+
+            const handleDisconnect = () => {
+              cleanup();
+              reject(new Error('Socket disconnected before registration completed.'));
+            };
+
+            socketRef.current.on('registered', handleRegistered);
+            socketRef.current.on('error', handleSocketError);
+            socketRef.current.on('disconnect', handleDisconnect);
+          });
+
+        const sendOfferIfReady = async () => {
+          if (!isInitiator || !remoteReadyRef.current || offerStartedRef.current || !peerConnectionRef.current) {
+            return;
+          }
+
+          offerStartedRef.current = true;
+          const offer = await peerConnectionRef.current.createOffer();
+          await peerConnectionRef.current.setLocalDescription(offer);
+
+          socketRef.current.emit('offer', {
+            offer,
+            target_id: matchedUser.user_id,
+            call_id: callId
+          });
+        };
+        const registrationPromise = waitForSocketRegistration();
+
         const registerSocketUser = () => {
           const accessToken = localStorage.getItem('access_token');
           if (!accessToken) {
@@ -1270,6 +1330,8 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         if (socketRef.current.connected) {
           registerSocketUser();
         }
+
+        await registrationPromise;
 
         const rtcConfig = await getRtcConfig();
         if (rtcConfig.turn_required && !rtcConfig.turn_enabled) {
@@ -1332,6 +1394,19 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           setMessages(prev => [...prev, { from: 'them', text: data.message }]);
         });
 
+        socketRef.current.on('call_ready', async (data) => {
+          if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
+            return;
+          }
+          remoteReadyRef.current = true;
+          try {
+            await sendOfferIfReady();
+          } catch (error) {
+            console.error('Offer start error:', error);
+            setCallError(getErrorMessage(error, 'Could not start call signaling.'));
+          }
+        });
+
         socketRef.current.on('error', (data) => {
           setCallError(data?.detail || 'A realtime error interrupted the call.');
         });
@@ -1341,16 +1416,10 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           handleEndCall(false);
         });
 
-        if (isInitiator) {
-          const offer = await peerConnectionRef.current.createOffer();
-          await peerConnectionRef.current.setLocalDescription(offer);
-
-          socketRef.current.emit('offer', {
-            offer,
-            target_id: matchedUser.user_id,
-            call_id: callId
-          });
-        }
+        socketRef.current.emit('call_ready', {
+          target_id: matchedUser.user_id,
+          call_id: callId,
+        });
 
       } catch (err) {
         console.error('Call setup error:', err);
