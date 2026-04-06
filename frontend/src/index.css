@@ -12,6 +12,7 @@ body {
   font-family: 'Outfit', sans-serif;
   background-color: #FFF8E7;
   color: #121212;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -20,10 +21,20 @@ h1, h2, h3, h4, h5, h6 {
   font-family: 'Bricolage Grotesque', sans-serif;
 }
 
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
 /* Neo-Brutalist Button Base */
 .btn-brutal {
-  @apply font-bold border-2 border-border rounded-none transition-all duration-200;
+  @apply inline-flex items-center justify-center gap-2 border-2 border-border rounded-none px-5 py-3 text-sm font-bold leading-tight transition-all duration-200 sm:text-base;
   box-shadow: 4px 4px 0px #121212;
+  min-height: 3.25rem;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
 }
 
 .btn-brutal:hover {
@@ -37,34 +48,35 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .btn-primary {
-  @apply btn-brutal bg-primary text-text-primary px-6 py-3;
+  @apply btn-brutal bg-primary text-text-primary;
 }
 
 .btn-secondary {
-  @apply btn-brutal bg-secondary text-white px-6 py-3;
+  @apply btn-brutal bg-secondary text-white;
 }
 
 .btn-mint {
-  @apply btn-brutal bg-accent-mint text-text-primary px-6 py-3;
+  @apply btn-brutal bg-accent-mint text-text-primary;
 }
 
 .btn-lilac {
-  @apply btn-brutal bg-accent-lilac text-text-primary px-6 py-3;
+  @apply btn-brutal bg-accent-lilac text-text-primary;
 }
 
 .btn-yellow {
-  @apply btn-brutal bg-accent-yellow text-text-primary px-6 py-3;
+  @apply btn-brutal bg-accent-yellow text-text-primary;
 }
 
 /* Card Base */
 .card-brutal {
-  @apply bg-surface border-2 border-border p-6 rounded-none;
+  @apply bg-surface border-2 border-border p-4 rounded-none sm:p-6;
   box-shadow: 4px 4px 0px #121212;
 }
 
 /* Input Base */
 .input-brutal {
-  @apply w-full p-4 text-lg border-2 border-border rounded-none bg-surface outline-none transition-all;
+  @apply w-full border-2 border-border rounded-none bg-surface px-4 py-3 text-base outline-none transition-all sm:py-4 sm:text-lg;
+  min-height: 3.25rem;
 }
 
 .input-brutal:focus {
@@ -119,4 +131,25 @@ h1, h2, h3, h4, h5, h6 {
 ::selection {
   background: #FF49DB;
   color: #121212;
+}
+
+@media (hover: none) {
+  .btn-brutal:hover {
+    transform: none;
+    box-shadow: 4px 4px 0px #121212;
+  }
+}
+
+@media (max-width: 640px) {
+  .btn-brutal {
+    box-shadow: 3px 3px 0px #121212;
+  }
+
+  .btn-brutal:active {
+    box-shadow: 1px 1px 0px #121212;
+  }
+
+  .card-brutal {
+    box-shadow: 3px 3px 0px #121212;
+  }
 }

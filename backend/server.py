@@ -7,7 +7,6 @@ import secrets
 import asyncio
 import logging
 import ipaddress
-import hashlib
 import json
 import re
 from datetime import datetime, timezone, timedelta
@@ -138,7 +137,7 @@ RATE_LIMITS = {
     "auth_login": (10, 15 * 60),
     "profile_update": (10, 10 * 60),
     "friend_add": (20, 10 * 60),
-    "match_find": (30, 60),
+    "match_find": (90, 60),
     "match_cancel": (30, 60),
     "report_create": (10, 60 * 60),
     "block_create": (30, 60 * 60),
@@ -323,11 +322,8 @@ sio = socketio.AsyncServer(
 )
 
 # Matching queues
-matching_queues = {
-    "same_college": {},  # {college_id: [{user_id, queued_at}]}
-    "same_wifi": {},      # {wifi_id: [{user_id, queued_at}]}
-    "cross_college": []   # [{user_id, college, queued_at}]
-}
+matching_queues: Dict[str, List[str]] = {}
+match_queue_states: Dict[str, Dict[str, str]] = {}
 
 # Active connections
 active_users = {}  # local-dev fallback only {user_id: sid}
@@ -335,7 +331,6 @@ sid_user_map: Dict[str, str] = {}
 active_calls = {}  # local-dev fallback only
 pending_matches: Dict[str, Dict[str, Any]] = {}  # {user_id: {matched_user_id, call_id, mode, created_at, is_initiator}}
 call_ready_states: Dict[str, set[str]] = {}
-matching_lock = asyncio.Lock()
 in_memory_rate_limits: Dict[str, List[float]] = {}
 
 async def get_db():
@@ -346,24 +341,30 @@ def redis_key(*parts: str) -> str:
     return ":".join([REDIS_NAMESPACE, *parts])
 
 
-def stable_key_fragment(value: Optional[str]) -> str:
-    if not value:
-        return "default"
-    return hashlib.sha1(value.encode("utf-8")).hexdigest()
+def normalize_queue_fragment(value: Optional[str], default: str = "unknown") -> str:
+    normalized = re.sub(r"[^a-z0-9._-]+", "-", (value or default).strip().lower())
+    normalized = normalized.strip("-")
+    return normalized or default
 
 
 def user_room(user_id: str) -> str:
     return f"user:{user_id}"
 
 
-def queue_key_for(mode: str, bucket: Optional[str] = None) -> str:
-    if mode == "cross_college":
-        return redis_key("match", "queue", mode)
-    return redis_key("match", "queue", mode, stable_key_fragment(bucket))
+def queue_key_for(
+    mode: str,
+    college: Optional[str] = None,
+    wifi: Optional[str] = None,
+) -> str:
+    if mode == "same_college":
+        return redis_key("queue", "college", normalize_queue_fragment(college))
+    if mode == "same_wifi":
+        return redis_key("queue", "wifi", normalize_queue_fragment(wifi))
+    return redis_key("queue", "global")
 
 
-def user_queue_set_key(user_id: str) -> str:
-    return redis_key("match", "user-queues", user_id)
+def match_queue_state_key(user_id: str) -> str:
+    return redis_key("match", "queue-state", user_id)
 
 
 def pending_match_key(user_id: str) -> str:
@@ -597,69 +598,186 @@ async def get_socket_user_id(sid: str) -> Optional[str]:
     return session.get("user_id")
 
 
-async def remove_user_from_queues(user_id: str) -> None:
+def decode_redis_string(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    return str(value)
+
+
+async def get_match_queue_state(user_id: str) -> Optional[Dict[str, str]]:
     if redis_client is None:
-        remove_user_from_queues_locked(user_id)
-        return
+        state = match_queue_states.get(user_id)
+        return dict(state) if state else None
 
-    queue_keys = await redis_client.smembers(user_queue_set_key(user_id))
-    if not queue_keys:
-        return
-
-    pipeline = redis_client.pipeline()
-    for key in queue_keys:
-        decoded_key = key.decode("utf-8") if isinstance(key, bytes) else key
-        pipeline.zrem(decoded_key, user_id)
-    pipeline.delete(user_queue_set_key(user_id))
-    await pipeline.execute()
+    raw_state = await redis_client.get(match_queue_state_key(user_id))
+    if raw_state is None:
+        return None
+    return json_loads(raw_state)
 
 
-async def prune_queue(queue_key: str) -> None:
-    if redis_client is None:
-        return
-    cutoff = utcnow().timestamp() - MATCH_QUEUE_TTL_SECONDS
-    await redis_client.zremrangebyscore(queue_key, "-inf", cutoff)
-
-
-async def enqueue_waiter_shared(queue_name: str, user_id: str, **metadata: Any) -> None:
-    if redis_client is None:
-        raise RuntimeError("enqueue_waiter_shared should not be used without Redis.")
-    await prune_queue(queue_name)
-    await redis_client.zadd(queue_name, {user_id: utcnow().timestamp()})
-    await redis_client.sadd(user_queue_set_key(user_id), queue_name)
-    await redis_client.expire(user_queue_set_key(user_id), MATCH_QUEUE_TTL_SECONDS)
-    if metadata:
-        await redis_client.set(
-            redis_key("match", "queue-meta", user_id),
-            json_dumps(metadata),
-            ex=MATCH_QUEUE_TTL_SECONDS,
-        )
-
-
-async def pop_next_waiter_shared(
-    queue_name: str,
-    current_user_id: str,
+async def set_match_queue_state(
+    user_id: str,
     *,
-    current_college: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+    queue: str,
+    mode: str,
+    college: str = "",
+    wifi: str = "",
+) -> None:
+    state = {
+        "queue": queue,
+        "mode": mode,
+        "college": college,
+        "wifi": wifi,
+    }
     if redis_client is None:
-        raise RuntimeError("pop_next_waiter_shared should not be used without Redis.")
+        match_queue_states[user_id] = state
+        return
 
-    await prune_queue(queue_name)
-    candidate_ids = await redis_client.zrange(queue_name, 0, 50)
-    for raw_candidate in candidate_ids:
-        candidate_id = raw_candidate.decode("utf-8") if isinstance(raw_candidate, bytes) else raw_candidate
-        if candidate_id == current_user_id:
-            continue
-        if current_college:
-            candidate_user = await db.users.find_one({"user_id": candidate_id}, {"college": 1, "_id": 0})
-            if not candidate_user or candidate_user.get("college") == current_college:
-                continue
+    await redis_client.set(
+        match_queue_state_key(user_id),
+        json_dumps(state),
+        ex=MATCH_QUEUE_TTL_SECONDS,
+    )
 
-        await redis_client.zrem(queue_name, candidate_id)
-        await redis_client.srem(user_queue_set_key(candidate_id), queue_name)
-        return {"user_id": candidate_id}
-    return None
+
+async def clear_match_queue_state(user_id: str) -> None:
+    if redis_client is None:
+        match_queue_states.pop(user_id, None)
+        return
+
+    await redis_client.delete(match_queue_state_key(user_id))
+
+
+async def pop_queued_user(queue: str) -> Optional[str]:
+    if redis_client is None:
+        queue_users = matching_queues.get(queue)
+        if not queue_users:
+            return None
+        candidate_id = queue_users.pop(0)
+        if not queue_users:
+            matching_queues.pop(queue, None)
+        return candidate_id
+
+    candidate_id = await redis_client.lpop(queue)
+    return decode_redis_string(candidate_id)
+
+
+async def enqueue_user(user_id: str, queue: str) -> None:
+    if redis_client is None:
+        queue_users = matching_queues.setdefault(queue, [])
+        if user_id not in queue_users:
+            queue_users.append(user_id)
+        return
+
+    await redis_client.rpush(queue, user_id)
+    await redis_client.expire(queue, MATCH_QUEUE_TTL_SECONDS)
+
+
+async def remove_user_from_queues(user_id: str) -> None:
+    state = await get_match_queue_state(user_id)
+    if not state:
+        return
+
+    queue = state.get("queue")
+    await clear_match_queue_state(user_id)
+    if not queue:
+        return
+
+    if redis_client is None:
+        queue_users = matching_queues.get(queue, [])
+        matching_queues[queue] = [queued_user_id for queued_user_id in queue_users if queued_user_id != user_id]
+        if not matching_queues[queue]:
+            matching_queues.pop(queue, None)
+        return
+
+    await redis_client.lrem(queue, 0, user_id)
+
+
+async def create_match(user1: Dict[str, str], user2: Dict[str, str]) -> Dict[str, Any]:
+    call_id = f"call_{uuid.uuid4().hex[:12]}"
+    call_doc: Dict[str, Any] = {
+        "call_id": call_id,
+        "participants": [user1["user_id"], user2["user_id"]],
+        "mode": user1["mode"],
+        "status": "matched",
+        "created_at": utcnow(),
+    }
+    if user1["mode"] == "same_wifi":
+        call_doc["same_wifi_bucket"] = user1.get("wifi") or user2.get("wifi")
+
+    await db.call_history.insert_one(call_doc)
+    await set_pending_match(
+        user2["user_id"],
+        {
+            "matched_user_id": user1["user_id"],
+            "call_id": call_id,
+            "mode": user1["mode"],
+            "is_initiator": False,
+            "created_at": utcnow().isoformat(),
+        },
+    )
+    return {
+        "matched_user_id": user2["user_id"],
+        "call_id": call_id,
+        "mode": user1["mode"],
+        "is_initiator": True,
+        "created_at": utcnow().isoformat(),
+    }
+
+
+async def find_match(
+    user_id: str,
+    mode: Literal["same_college", "same_wifi", "cross_college"],
+    college: str,
+    wifi: str,
+) -> Optional[Dict[str, Any]]:
+    queue = queue_key_for(mode, college=college, wifi=wifi)
+    current_state = await get_match_queue_state(user_id)
+
+    if current_state:
+        current_queue = current_state.get("queue")
+        if current_queue == queue:
+            await set_match_queue_state(user_id, queue=queue, mode=mode, college=college, wifi=wifi)
+            if redis_client is not None:
+                await redis_client.expire(queue, MATCH_QUEUE_TTL_SECONDS)
+            return None
+        await remove_user_from_queues(user_id)
+
+    candidate_id = await pop_queued_user(queue)
+    if not candidate_id:
+        await set_match_queue_state(user_id, queue=queue, mode=mode, college=college, wifi=wifi)
+        await enqueue_user(user_id, queue)
+        return None
+
+    candidate_state = await get_match_queue_state(candidate_id)
+    if candidate_id == user_id or not candidate_state or candidate_state.get("queue") != queue:
+        await set_match_queue_state(user_id, queue=queue, mode=mode, college=college, wifi=wifi)
+        await enqueue_user(user_id, queue)
+        return None
+
+    if mode == "cross_college" and candidate_state.get("college") == college:
+        await enqueue_user(candidate_id, queue)
+        await set_match_queue_state(user_id, queue=queue, mode=mode, college=college, wifi=wifi)
+        await enqueue_user(user_id, queue)
+        return None
+
+    await clear_match_queue_state(candidate_id)
+    return await create_match(
+        {
+            "user_id": user_id,
+            "mode": mode,
+            "college": college,
+            "wifi": wifi,
+        },
+        {
+            "user_id": candidate_id,
+            "mode": candidate_state.get("mode", mode),
+            "college": candidate_state.get("college", ""),
+            "wifi": candidate_state.get("wifi", ""),
+        },
+    )
 
 
 async def get_pending_match(user_id: str) -> Optional[Dict[str, Any]]:
@@ -713,7 +831,15 @@ async def clear_call_ready_state(call_id: Optional[str]) -> None:
 
 async def discard_pending_match(user_id: str) -> Optional[Dict[str, Any]]:
     if redis_client is None:
-        return discard_pending_match_locked(user_id)
+        pending = pending_matches.pop(user_id, None)
+        if not pending:
+            return None
+
+        matched_user_id = pending.get("matched_user_id")
+        counterpart_pending = pending_matches.get(matched_user_id)
+        if counterpart_pending and counterpart_pending.get("matched_user_id") == user_id:
+            pending_matches.pop(matched_user_id, None)
+        return pending
 
     current_key = pending_match_key(user_id)
     raw_pending = await redis_client.get(current_key)
@@ -733,27 +859,6 @@ async def discard_pending_match(user_id: str) -> Optional[Dict[str, Any]]:
                 await redis_client.delete(other_key)
 
     return pending
-
-
-@asynccontextmanager
-async def acquire_match_lock():
-    if redis_client is None:
-        async with matching_lock:
-            yield
-        return
-
-    redis_lock = redis_client.lock(redis_key("match", "lock"), timeout=10, blocking_timeout=5)
-    acquired = await redis_lock.acquire()
-    if not acquired:
-        raise HTTPException(status_code=503, detail="Matching is temporarily busy. Please retry.")
-
-    try:
-        yield
-    finally:
-        try:
-            await redis_lock.release()
-        except RedisError:
-            logger.warning("Failed to release Redis match lock cleanly.")
 
 
 async def ping_database() -> bool:
@@ -899,72 +1004,6 @@ def build_ice_servers() -> List[Dict[str, Any]]:
             }
         )
     return ice_servers
-
-
-def is_waiter_expired(waiter: Dict[str, Any]) -> bool:
-    return utcnow() - waiter["queued_at"] > timedelta(seconds=MATCH_QUEUE_TTL_SECONDS)
-
-
-def prune_waiters(queue: List[Dict[str, Any]]) -> None:
-    queue[:] = [waiter for waiter in queue if not is_waiter_expired(waiter)]
-
-
-def enqueue_waiter(queue: List[Dict[str, Any]], user_id: str, **metadata: Any) -> None:
-    prune_waiters(queue)
-    if any(waiter["user_id"] == user_id for waiter in queue):
-        return
-    queue.append({"user_id": user_id, "queued_at": utcnow(), **metadata})
-
-
-def pop_next_waiter(
-    queue: List[Dict[str, Any]],
-    current_user_id: str,
-    current_college: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    prune_waiters(queue)
-    for index, waiter in enumerate(queue):
-        if waiter["user_id"] == current_user_id:
-            continue
-        if current_college and waiter.get("college") == current_college:
-            continue
-        return queue.pop(index)
-    return None
-
-
-def remove_user_from_queues_locked(user_id: str) -> None:
-    for queue in matching_queues["same_college"].values():
-        queue[:] = [waiter for waiter in queue if waiter["user_id"] != user_id]
-
-    for queue in matching_queues["same_wifi"].values():
-        queue[:] = [waiter for waiter in queue if waiter["user_id"] != user_id]
-
-    matching_queues["cross_college"][:] = [
-        waiter for waiter in matching_queues["cross_college"] if waiter["user_id"] != user_id
-    ]
-
-
-def prune_pending_matches_locked() -> None:
-    now = utcnow()
-    expired_user_ids = [
-        user_id
-        for user_id, pending in pending_matches.items()
-        if now - pending["created_at"] > timedelta(seconds=MATCH_PENDING_TTL_SECONDS)
-    ]
-    for user_id in expired_user_ids:
-        pending_matches.pop(user_id, None)
-
-
-def discard_pending_match_locked(user_id: str) -> Optional[Dict[str, Any]]:
-    pending = pending_matches.pop(user_id, None)
-    if not pending:
-        return None
-
-    matched_user_id = pending.get("matched_user_id")
-    counterpart_pending = pending_matches.get(matched_user_id)
-    if counterpart_pending and counterpart_pending.get("matched_user_id") == user_id:
-        pending_matches.pop(matched_user_id, None)
-
-    return pending
 
 # Password functions
 def hash_password(password: str) -> str:
@@ -1748,11 +1787,10 @@ async def block_user(data: BlockUserRequest, request: Request):
     except DuplicateKeyError:
         return {"status": "success", "message": "User already blocked"}
 
-    async with acquire_match_lock():
-        await remove_user_from_queues(user["user_id"])
-        await remove_user_from_queues(data.target_user_id)
-        await discard_pending_match(user["user_id"])
-        await discard_pending_match(data.target_user_id)
+    await remove_user_from_queues(user["user_id"])
+    await remove_user_from_queues(data.target_user_id)
+    await discard_pending_match(user["user_id"])
+    await discard_pending_match(data.target_user_id)
 
     return {"status": "success", "message": "User blocked"}
 
@@ -1834,7 +1872,7 @@ async def get_call_history(request: Request):
 # ============ MATCHING ENDPOINTS ============
 
 @app.post("/api/match/find")
-async def find_match(data: ConnectRequest, request: Request):
+async def find_match_endpoint(data: ConnectRequest, request: Request):
     """Find a match based on connection mode"""
     user = await get_current_user(request)
     await enforce_rate_limit(
@@ -1848,126 +1886,17 @@ async def find_match(data: ConnectRequest, request: Request):
 
     user_id = user["user_id"]
     college = user.get("college", "")
-    current_match: Optional[Dict[str, Any]] = None
+    wifi = ""
+    if data.mode == "same_wifi":
+        wifi = derive_wifi_bucket(
+            request,
+            data.wifi_identifier,
+            data.network_fingerprint,
+        )
 
-    async with acquire_match_lock():
-        pending = await get_pending_match(user_id)
-        if pending:
-            current_match = pending
-        else:
-            await remove_user_from_queues(user_id)
-
-            network_bucket: Optional[str] = None
-            network_buckets: List[str] = []
-            network_queue_names: List[str] = []
-            matched_network_bucket: Optional[str] = None
-            matched_waiter: Optional[Dict[str, Any]] = None
-            queue_name: Optional[str] = None
-
-            if data.mode == "same_college":
-                queue_name = queue_key_for("same_college", college)
-            elif data.mode == "same_wifi":
-                network_buckets = derive_same_network_buckets(
-                    request,
-                    data.wifi_identifier,
-                    data.network_fingerprint,
-                )
-                if not network_buckets:
-                    network_buckets = ["unknown"]
-                network_bucket = network_buckets[0]
-                network_queue_names = [queue_key_for("same_wifi", bucket) for bucket in network_buckets]
-            else:
-                queue_name = queue_key_for("cross_college")
-
-            while True:
-                if redis_client is not None:
-                    if data.mode == "cross_college":
-                        matched_waiter = await pop_next_waiter_shared(
-                            queue_name,
-                            user_id,
-                            current_college=college,
-                        )
-                    elif data.mode == "same_wifi":
-                        for index, candidate_queue_name in enumerate(network_queue_names):
-                            matched_waiter = await pop_next_waiter_shared(candidate_queue_name, user_id)
-                            if matched_waiter:
-                                matched_network_bucket = network_buckets[index]
-                                break
-                    else:
-                        matched_waiter = await pop_next_waiter_shared(queue_name, user_id)
-                else:
-                    if data.mode == "same_college":
-                        queue = matching_queues["same_college"].setdefault(college, [])
-                        matched_waiter = pop_next_waiter(queue, user_id)
-                    elif data.mode == "same_wifi":
-                        for candidate_bucket in network_buckets:
-                            queue = matching_queues["same_wifi"].setdefault(candidate_bucket, [])
-                            matched_waiter = pop_next_waiter(queue, user_id)
-                            if matched_waiter:
-                                matched_network_bucket = candidate_bucket
-                                break
-                    else:
-                        queue = matching_queues["cross_college"]
-                        matched_waiter = pop_next_waiter(queue, user_id, current_college=college)
-
-                if not matched_waiter:
-                    break
-                if await are_users_blocked(user_id, matched_waiter["user_id"]):
-                    matched_waiter = None
-                    continue
-                await remove_user_from_queues(matched_waiter["user_id"])
-                break
-
-            if not matched_waiter:
-                if redis_client is not None:
-                    metadata = {"college": college} if data.mode == "cross_college" else {}
-                    if data.mode == "same_wifi":
-                        for candidate_queue_name in network_queue_names:
-                            await enqueue_waiter_shared(candidate_queue_name, user_id)
-                    else:
-                        await enqueue_waiter_shared(queue_name, user_id, **metadata)
-                elif data.mode == "same_college":
-                    queue = matching_queues["same_college"].setdefault(college, [])
-                    enqueue_waiter(queue, user_id)
-                elif data.mode == "same_wifi":
-                    for candidate_bucket in network_buckets:
-                        queue = matching_queues["same_wifi"].setdefault(candidate_bucket, [])
-                        enqueue_waiter(queue, user_id)
-                else:
-                    queue = matching_queues["cross_college"]
-                    enqueue_waiter(queue, user_id, college=college)
-
-            if matched_waiter:
-                call_id = f"call_{uuid.uuid4().hex[:12]}"
-                await db.call_history.insert_one(
-                    {
-                        "call_id": call_id,
-                        "participants": [user_id, matched_waiter["user_id"]],
-                        "mode": data.mode,
-                        "status": "matched",
-                        "same_wifi_bucket": matched_network_bucket or network_bucket,
-                        "created_at": utcnow(),
-                    }
-                )
-
-                await set_pending_match(
-                    matched_waiter["user_id"],
-                    {
-                        "matched_user_id": user_id,
-                        "call_id": call_id,
-                        "mode": data.mode,
-                        "is_initiator": False,
-                        "created_at": utcnow().isoformat(),
-                    },
-                )
-
-                current_match = {
-                    "matched_user_id": matched_waiter["user_id"],
-                    "call_id": call_id,
-                    "mode": data.mode,
-                    "is_initiator": True,
-                    "created_at": utcnow().isoformat(),
-                }
+    current_match = await get_pending_match(user_id)
+    if not current_match:
+        current_match = await find_match(user_id, data.mode, college, wifi)
 
     if not current_match:
         return {"status": "waiting", "message": "Looking for a match..."}
@@ -1977,11 +1906,8 @@ async def find_match(data: ConnectRequest, request: Request):
         {"_id": 0, "password_hash": 0, "email": 0},
     )
     if not matched_user:
-        async with acquire_match_lock():
-            await discard_pending_match(current_match["matched_user_id"])
+        await discard_pending_match(current_match["matched_user_id"])
         raise HTTPException(status_code=404, detail="Matched user is no longer available")
-
-    await enforce_not_blocked(user_id, matched_user["user_id"])
 
     return {
         "status": "matched",
@@ -2002,11 +1928,10 @@ async def cancel_match(request: Request):
     user_id = user["user_id"]
     cancelled_call_id = None
 
-    async with acquire_match_lock():
-        await remove_user_from_queues(user_id)
-        pending = await discard_pending_match(user_id)
-        if pending:
-            cancelled_call_id = pending.get("call_id")
+    await remove_user_from_queues(user_id)
+    pending = await discard_pending_match(user_id)
+    if pending:
+        cancelled_call_id = pending.get("call_id")
 
     if cancelled_call_id:
         await db.call_history.update_one(
@@ -2231,11 +2156,10 @@ async def disconnect(sid):
             {"$set": {"online": still_online, "last_seen": utcnow()}}
         )
 
-        async with acquire_match_lock():
-            await remove_user_from_queues(user_id)
-            pending = await discard_pending_match(user_id)
-            if pending:
-                cancelled_call_id = pending.get("call_id")
+        await remove_user_from_queues(user_id)
+        pending = await discard_pending_match(user_id)
+        if pending:
+            cancelled_call_id = pending.get("call_id")
 
         if cancelled_call_id:
             await db.call_history.update_one(
