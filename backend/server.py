@@ -49,9 +49,21 @@ def parse_bool_env(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def strip_wrapping_quotes(value: str) -> str:
+    cleaned = value.strip()
+    if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
+        return cleaned[1:-1].strip()
+    return cleaned
+
+
 def parse_csv_env(name: str, default: str = "") -> List[str]:
-    raw_value = os.environ.get(name, default)
-    return [item.strip().rstrip("/") for item in raw_value.split(",") if item.strip()]
+    raw_value = strip_wrapping_quotes(os.environ.get(name, default))
+    values: List[str] = []
+    for item in raw_value.split(","):
+        cleaned = strip_wrapping_quotes(item).rstrip("/")
+        if cleaned:
+            values.append(cleaned)
+    return values
 
 
 def utcnow() -> datetime:
