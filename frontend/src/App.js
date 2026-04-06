@@ -1634,7 +1634,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         peerConnectionRef.current = new RTCPeerConnection({
           iceServers: rtcConfig.ice_servers,
-          iceTransportPolicy: rtcConfig.turn_required ? 'relay' : 'all',
+          iceTransportPolicy: 'all',
           iceCandidatePoolSize: 10,
         });
 
