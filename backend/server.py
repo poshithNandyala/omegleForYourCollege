@@ -56,11 +56,19 @@ def strip_wrapping_quotes(value: str) -> str:
     return cleaned
 
 
+def strip_env_assignment_prefix(value: str, name: str) -> str:
+    cleaned = strip_wrapping_quotes(value)
+    prefix = f"{name}="
+    if cleaned.startswith(prefix):
+        return cleaned[len(prefix):].strip()
+    return cleaned
+
+
 def parse_csv_env(name: str, default: str = "") -> List[str]:
-    raw_value = strip_wrapping_quotes(os.environ.get(name, default))
+    raw_value = strip_env_assignment_prefix(os.environ.get(name, default), name)
     values: List[str] = []
     for item in raw_value.split(","):
-        cleaned = strip_wrapping_quotes(item).rstrip("/")
+        cleaned = strip_env_assignment_prefix(item, name).rstrip("/")
         if cleaned:
             values.append(cleaned)
     return values
