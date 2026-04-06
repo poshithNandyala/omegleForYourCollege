@@ -147,7 +147,9 @@ const deriveSameNetworkFingerprint = async () => {
   return new Promise((resolve) => {
     let settled = false;
     let detectedSubnet = null;
-    const peerConnection = new RTCPeerConnection({ iceServers: [] });
+    const peerConnection = new RTCPeerConnection({
+      iceServers: DEFAULT_ICE_SERVERS,
+    });
 
     const finish = async (subnet) => {
       if (settled) {
@@ -1632,6 +1634,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         peerConnectionRef.current = new RTCPeerConnection({
           iceServers: rtcConfig.ice_servers,
+          iceTransportPolicy: rtcConfig.turn_required ? 'relay' : 'all',
           iceCandidatePoolSize: 10,
         });
 
