@@ -1638,6 +1638,18 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           iceCandidatePoolSize: 10,
         });
 
+        const attachRemoteStream = (incomingStream) => {
+          if (!incomingStream || !remoteVideoRef.current) {
+            return;
+          }
+
+          remoteStreamRef.current = incomingStream;
+          if (remoteVideoRef.current.srcObject !== incomingStream) {
+            remoteVideoRef.current.srcObject = incomingStream;
+          }
+          ensureVideoPlayback(remoteVideoRef.current);
+        };
+
         const flushPendingIceCandidates = async () => {
           if (!peerConnectionRef.current?.remoteDescription?.type || pendingIceCandidatesRef.current.length === 0) {
             return;
@@ -1661,19 +1673,28 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         // Handle remote stream
         peerConnectionRef.current.ontrack = (event) => {
-          if (!remoteStreamRef.current) {
-            remoteStreamRef.current = new MediaStream();
-          }
-          remoteStreamRef.current.addTrack(event.track);
-          if (remoteVideoRef.current) {
-            if (remoteVideoRef.current.srcObject !== remoteStreamRef.current) {
-              remoteVideoRef.current.srcObject = remoteStreamRef.current;
+          const incomingStream = event.streams?.[0];
+          if (incomingStream) {
+            attachRemoteStream(incomingStream);
+          } else {
+            if (!remoteStreamRef.current) {
+              remoteStreamRef.current = new MediaStream();
             }
-            ensureVideoPlayback(remoteVideoRef.current);
+            remoteStreamRef.current.addTrack(event.track);
+            attachRemoteStream(remoteStreamRef.current);
           }
+
           if (event.track.kind === 'video') {
-            setRemoteVideoReady(true);
-            setCallStatus('Connected');
+            const markRemoteVideoReady = () => {
+              setRemoteVideoReady(true);
+              setCallStatus('Connected');
+              ensureVideoPlayback(remoteVideoRef.current);
+            };
+
+            if (event.track.readyState === 'live' && !event.track.muted) {
+              markRemoteVideoReady();
+            }
+            event.track.onunmute = markRemoteVideoReady;
           }
         };
 
@@ -1705,12 +1726,16 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             socketRef.current.emit('ice_candidate', {
               candidate: event.candidate,
               target_id: matchedUser.user_id,
+              call_id: callId,
             });
           }
         };
 
         // Handle incoming offer
         socketRef.current.on('offer', async (data) => {
+          if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
+            return;
+          }
           await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.offer));
           await flushPendingIceCandidates();
           const answer = await peerConnectionRef.current.createAnswer();
@@ -1725,6 +1750,9 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         // Handle answer
         socketRef.current.on('answer', async (data) => {
+          if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
+            return;
+          }
           await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.answer));
           await flushPendingIceCandidates();
         });
@@ -1732,6 +1760,9 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         // Handle ICE candidates
         socketRef.current.on('ice_candidate', async (data) => {
           if (!data?.candidate || !peerConnectionRef.current) {
+            return;
+          }
+          if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
             return;
           }
 
@@ -1774,7 +1805,10 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         });
 
         // Handle call ended
-        socketRef.current.on('call_ended', () => {
+        socketRef.current.on('call_ended', (data) => {
+          if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
+            return;
+          }
           handleEndCall(false);
         });
 
@@ -1948,6 +1982,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             ref={remoteVideoRef}
             autoPlay
             playsInline
+            onLoadedMetadata={() => ensureVideoPlayback(remoteVideoRef.current)}
             className="w-full h-full object-cover"
           />
           <div className="absolute inset-0 bg-gradient-to-b from-black/35 via-transparent to-black/70 pointer-events-none" />

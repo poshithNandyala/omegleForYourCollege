@@ -2442,7 +2442,8 @@ async def ice_candidate(sid, data):
 
     await sio.emit("ice_candidate", {
         "candidate": data.get("candidate"),
-        "from_id": user_id
+        "from_id": user_id,
+        "call_id": data.get("call_id"),
     }, room=user_room(target_id))
 
 @sio.event
