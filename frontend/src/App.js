@@ -55,6 +55,57 @@ const getRtcConfig = async () => {
 const getErrorMessage = (error, fallback) =>
   error?.response?.data?.detail || error?.message || fallback;
 
+const summarizeTrack = (track) => {
+  if (!track) {
+    return null;
+  }
+
+  return {
+    id: track.id,
+    kind: track.kind,
+    enabled: track.enabled,
+    muted: track.muted,
+    readyState: track.readyState,
+    label: track.label,
+  };
+};
+
+const summarizeDailyParticipant = (participant) => {
+  if (!participant) {
+    return null;
+  }
+
+  return {
+    session_id: participant.session_id,
+    user_id: participant.user_id,
+    user_name: participant.user_name,
+    local: participant.local,
+    audio: summarizeTrack(participant?.tracks?.audio?.persistentTrack || participant?.tracks?.audio?.track || null),
+    video: summarizeTrack(participant?.tracks?.video?.persistentTrack || participant?.tracks?.video?.track || null),
+  };
+};
+
+const extractIceCandidateType = (candidateString) => {
+  if (!candidateString) {
+    return null;
+  }
+  const match = candidateString.match(/\btyp\s+([a-z]+)/i);
+  return match?.[1] || null;
+};
+
+const summarizeIceCandidate = (candidate) => {
+  if (!candidate) {
+    return null;
+  }
+
+  return {
+    candidateType: extractIceCandidateType(candidate.candidate),
+    sdpMid: candidate.sdpMid,
+    sdpMLineIndex: candidate.sdpMLineIndex,
+    candidate: candidate.candidate,
+  };
+};
+
 const ensureVideoPlayback = (videoElement) => {
   if (!videoElement?.play) {
     return;
@@ -1483,6 +1534,24 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
     onEndCall();
   }, [callId, matchedUser.user_id, onEndCall]);
 
+  const debugLog = useCallback((stage, details = {}) => {
+    const payload = {
+      timestamp: new Date().toISOString(),
+      callId,
+      stage,
+      provider: callProviderRef.current,
+      details,
+    };
+    console.log(`[CampusLinkCall ${callId}] ${stage}`, payload);
+    if (typeof window !== 'undefined') {
+      window.__campuslinkCallDebug = payload;
+      if (!Array.isArray(window.__campuslinkCallLog)) {
+        window.__campuslinkCallLog = [];
+      }
+      window.__campuslinkCallLog.push(payload);
+    }
+  }, [callId]);
+
   // Fetch ice breakers
   useEffect(() => {
     const fetchIceBreakers = async () => {
@@ -1547,6 +1616,10 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
     const participants = callObject.participants();
     const localParticipant = participants.local;
     const remoteParticipant = Object.values(participants).find((participant) => participant && !participant.local);
+    debugLog('daily:participants-sync', {
+      local: summarizeDailyParticipant(localParticipant),
+      remote: summarizeDailyParticipant(remoteParticipant),
+    });
 
     const localStream = buildMediaStreamFromTracks([
       localParticipant?.tracks?.video?.persistentTrack || localParticipant?.tracks?.video?.track || null,
@@ -1572,7 +1645,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
       return;
     }
     setCallStatus('Waiting for the other person to join...');
-  }, [attachVideoElementStream, buildMediaStreamFromTracks]);
+  }, [attachVideoElementStream, buildMediaStreamFromTracks, debugLog]);
 
   useEffect(() => {
     let isMounted = true;
@@ -1581,6 +1654,12 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
     const setupCall = async () => {
       try {
+        debugLog('setup:start', {
+          matchedUserId: matchedUser.user_id,
+          matchedUserName: matchedUser.name,
+          mode,
+          isInitiator,
+        });
         remoteReadyRef.current = false;
         offerStartedRef.current = false;
         socketRegisteredRef.current = false;
@@ -1592,7 +1671,24 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         remoteStreamRef.current = null;
         attachVideoElementStream(remoteVideoRef.current, null);
 
-        const callSessionPromise = axios.get(`/api/calls/session/${callId}`).then(({ data }) => data);
+        const callSessionPromise = axios.get(`/api/calls/session/${callId}`).then(({ data }) => {
+          debugLog('session:received', {
+            provider: data.provider,
+            room_url: data.room_url,
+            token_present: Boolean(data.token),
+            turn_enabled: data.turn_enabled,
+            turn_required: data.turn_required,
+            ice_server_count: Array.isArray(data.ice_servers) ? data.ice_servers.length : 0,
+          });
+          return data;
+        }).catch((error) => {
+          debugLog('session:error', {
+            status: error?.response?.status,
+            detail: error?.response?.data,
+            message: getErrorMessage(error, 'Call session request failed.'),
+          });
+          throw error;
+        });
 
         socketRef.current = io(SOCKET_URL, {
           transports: ['websocket'],
@@ -1618,17 +1714,20 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
             const handleRegistered = () => {
               socketRegisteredRef.current = true;
+              debugLog('socket:registered', { socketId: socketRef.current?.id });
               cleanup();
               resolve();
             };
 
             const handleSocketError = (data) => {
               const detail = data?.detail || 'Socket registration failed.';
+              debugLog('socket:registration-error', data || {});
               cleanup();
               reject(new Error(detail));
             };
 
             const handleDisconnect = () => {
+              debugLog('socket:registration-disconnect', { socketId: socketRef.current?.id });
               cleanup();
               reject(new Error('Socket disconnected before registration completed.'));
             };
@@ -1642,29 +1741,43 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           const accessToken = localStorage.getItem('access_token');
           if (!accessToken) {
             setCallError('Your session expired. Please log in again before starting a call.');
+            debugLog('socket:register-missing-token');
             return;
           }
 
+          debugLog('socket:register-user', {
+            userId: user.user_id,
+            socketId: socketRef.current?.id,
+          });
           socketRef.current.emit('register_user', {
             user_id: user.user_id,
             access_token: accessToken,
           });
         };
 
-        socketRef.current.on('connect', registerSocketUser);
+        socketRef.current.on('connect', () => {
+          debugLog('socket:connect', { socketId: socketRef.current?.id });
+          registerSocketUser();
+        });
+        socketRef.current.on('disconnect', (reason) => {
+          debugLog('socket:disconnect', { reason, socketId: socketRef.current?.id });
+        });
         socketRef.current.on('chat_message', (data) => {
+          debugLog('socket:chat-message', { from_id: data?.from_id, hasMessage: Boolean(data?.message) });
           setMessages(prev => [...prev, { from: 'them', text: data.message }]);
           if (!chatOpenRef.current) {
             setUnreadMessages(prev => prev + 1);
           }
         });
         socketRef.current.on('error', (data) => {
+          debugLog('socket:error', data || {});
           setCallError(data?.detail || 'A realtime error interrupted the call.');
         });
         socketRef.current.on('call_ended', (data) => {
           if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
             return;
           }
+          debugLog('socket:call-ended', data || {});
           handleEndCall(false);
         });
 
@@ -1679,6 +1792,10 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         if (callSession.provider === 'daily') {
           callProviderRef.current = 'daily';
+          debugLog('daily:init', {
+            room_url: callSession.room_url,
+            token_present: Boolean(callSession.token),
+          });
           setCallStatus('Joining Daily room...');
           const dailyModule = await import('@daily-co/daily-js');
           const DailyIframe = dailyModule.default || dailyModule;
@@ -1695,34 +1812,58 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             if (!isMounted) {
               return;
             }
+            debugLog('daily:joined-meeting');
             setCallStatus('Joined room. Waiting for the other person...');
             syncDailyState();
           });
-          callObject.on('participant-joined', syncDailyState);
-          callObject.on('participant-updated', syncDailyState);
-          callObject.on('participant-left', syncDailyState);
-          callObject.on('track-started', syncDailyState);
-          callObject.on('track-stopped', syncDailyState);
+          callObject.on('participant-joined', (event) => {
+            debugLog('daily:participant-joined', event || {});
+            syncDailyState();
+          });
+          callObject.on('participant-updated', (event) => {
+            debugLog('daily:participant-updated', event || {});
+            syncDailyState();
+          });
+          callObject.on('participant-left', (event) => {
+            debugLog('daily:participant-left', event || {});
+            syncDailyState();
+          });
+          callObject.on('track-started', (event) => {
+            debugLog('daily:track-started', event || {});
+            syncDailyState();
+          });
+          callObject.on('track-stopped', (event) => {
+            debugLog('daily:track-stopped', event || {});
+            syncDailyState();
+          });
           callObject.on('left-meeting', () => {
             if (isMounted) {
+              debugLog('daily:left-meeting');
               setCallStatus('Call ended');
             }
           });
           callObject.on('error', (event) => {
             if (isMounted) {
+              debugLog('daily:error', event || {});
               setCallError(event?.errorMsg || event?.errorMsg?.message || 'Daily could not start the call.');
             }
           });
           callObject.on('camera-error', (event) => {
             if (isMounted) {
+              debugLog('daily:camera-error', event || {});
               setCallError(event?.errorMsg || 'Camera or microphone access was blocked.');
             }
           });
 
+          debugLog('daily:join-request', {
+            room_url: callSession.room_url,
+            token_present: Boolean(callSession.token),
+          });
           await callObject.join({
             url: callSession.room_url,
             token: callSession.token,
           });
+          debugLog('daily:join-success');
 
           if (isMounted) {
             syncDailyState();
@@ -1733,6 +1874,11 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         const rtcConfig = callSession.ice_servers
           ? callSession
           : await getRtcConfig();
+        debugLog('webrtc:init', {
+          turn_required: rtcConfig.turn_required,
+          turn_enabled: rtcConfig.turn_enabled,
+          ice_servers: rtcConfig.ice_servers,
+        });
         if (rtcConfig.turn_required && !rtcConfig.turn_enabled) {
           throw new Error('TURN relay is required before calls can start in production.');
         }
@@ -1740,6 +1886,10 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         const stream = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: true
+        });
+        debugLog('media:get-user-media-success', {
+          audioTracks: stream.getAudioTracks().map(summarizeTrack),
+          videoTracks: stream.getVideoTracks().map(summarizeTrack),
         });
         if (!isMounted) {
           stream.getTracks().forEach(track => track.stop());
@@ -1751,6 +1901,10 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         peerConnectionRef.current = new RTCPeerConnection({
           iceServers: rtcConfig.ice_servers,
+          iceTransportPolicy: 'all',
+          iceCandidatePoolSize: 10,
+        });
+        debugLog('webrtc:peer-created', {
           iceTransportPolicy: 'all',
           iceCandidatePoolSize: 10,
         });
@@ -1781,25 +1935,40 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         const sendOfferIfReady = async () => {
           if (!isInitiator || !remoteReadyRef.current || offerStartedRef.current || !peerConnectionRef.current) {
+            debugLog('webrtc:offer-skipped', {
+              isInitiator,
+              remoteReady: remoteReadyRef.current,
+              offerStarted: offerStartedRef.current,
+              peerReady: Boolean(peerConnectionRef.current),
+            });
             return;
           }
 
           offerStartedRef.current = true;
           const offer = await peerConnectionRef.current.createOffer();
           await peerConnectionRef.current.setLocalDescription(offer);
+          debugLog('webrtc:offer-created', { type: offer.type });
 
           socketRef.current.emit('offer', {
             offer,
             target_id: matchedUser.user_id,
             call_id: callId
           });
+          debugLog('socket:offer-sent', { target_id: matchedUser.user_id });
         };
 
         stream.getTracks().forEach(track => {
           peerConnectionRef.current.addTrack(track, stream);
         });
+        debugLog('webrtc:tracks-added', {
+          tracks: stream.getTracks().map(summarizeTrack),
+        });
 
         peerConnectionRef.current.ontrack = (event) => {
+          debugLog('webrtc:ontrack', {
+            streamCount: event.streams?.length || 0,
+            track: summarizeTrack(event.track),
+          });
           const incomingStream = event.streams?.[0];
           if (incomingStream) {
             attachRemoteStream(incomingStream);
@@ -1827,6 +1996,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         peerConnectionRef.current.onconnectionstatechange = () => {
           const state = peerConnectionRef.current?.connectionState;
+          debugLog('webrtc:connection-state', { state });
           if (state === 'connected') {
             setCallStatus('Connected');
           } else if (state === 'connecting') {
@@ -1840,6 +2010,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         peerConnectionRef.current.oniceconnectionstatechange = () => {
           const iceState = peerConnectionRef.current?.iceConnectionState;
+          debugLog('webrtc:ice-connection-state', { iceState });
           if (iceState === 'checking') {
             setCallStatus('Checking network route...');
           } else if (iceState === 'connected' || iceState === 'completed') {
@@ -1849,11 +2020,13 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
         peerConnectionRef.current.onicecandidate = (event) => {
           if (event.candidate) {
+            debugLog('webrtc:local-ice-candidate', summarizeIceCandidate(event.candidate));
             socketRef.current.emit('ice_candidate', {
               candidate: event.candidate,
               target_id: matchedUser.user_id,
               call_id: callId,
             });
+            debugLog('socket:ice-candidate-sent', { target_id: matchedUser.user_id });
           }
         };
 
@@ -1861,23 +2034,29 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
             return;
           }
+          debugLog('socket:offer-received', { from_id: data?.from_id });
           await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.offer));
+          debugLog('webrtc:remote-description-set', { type: data?.offer?.type });
           await flushPendingIceCandidates();
           const answer = await peerConnectionRef.current.createAnswer();
           await peerConnectionRef.current.setLocalDescription(answer);
+          debugLog('webrtc:answer-created', { type: answer.type });
 
           socketRef.current.emit('answer', {
             answer,
             target_id: data.from_id,
             call_id: callId
           });
+          debugLog('socket:answer-sent', { target_id: data.from_id });
         });
 
         socketRef.current.on('answer', async (data) => {
           if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
             return;
           }
+          debugLog('socket:answer-received', { from_id: data?.from_id });
           await peerConnectionRef.current.setRemoteDescription(new RTCSessionDescription(data.answer));
+          debugLog('webrtc:remote-description-set', { type: data?.answer?.type });
           await flushPendingIceCandidates();
         });
 
@@ -1888,15 +2067,27 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
             return;
           }
+          debugLog('socket:ice-candidate-received', {
+            from_id: data?.from_id,
+            candidate: summarizeIceCandidate(data.candidate),
+          });
 
           if (!peerConnectionRef.current.remoteDescription?.type) {
             pendingIceCandidatesRef.current.push(data.candidate);
+            debugLog('webrtc:ice-candidate-queued', {
+              queueLength: pendingIceCandidatesRef.current.length,
+            });
             return;
           }
 
           try {
             await peerConnectionRef.current.addIceCandidate(new RTCIceCandidate(data.candidate));
+            debugLog('webrtc:ice-candidate-added', summarizeIceCandidate(data.candidate));
           } catch (error) {
+            debugLog('webrtc:ice-candidate-error', {
+              message: error?.message,
+              candidate: summarizeIceCandidate(data.candidate),
+            });
             console.debug('ICE candidate error:', error);
           }
         });
@@ -1905,22 +2096,31 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
             return;
           }
+          debugLog('socket:call-ready-received', { from_id: data?.from_id });
           remoteReadyRef.current = true;
           setCallStatus('Peer ready. Negotiating video...');
           try {
             await sendOfferIfReady();
           } catch (error) {
+            debugLog('webrtc:offer-start-error', { message: error?.message });
             console.error('Offer start error:', error);
             setCallError(getErrorMessage(error, 'Could not start call signaling.'));
           }
         });
 
+        debugLog('socket:call-ready-sent', { target_id: matchedUser.user_id });
         socketRef.current.emit('call_ready', {
           target_id: matchedUser.user_id,
           call_id: callId,
         });
 
       } catch (err) {
+        debugLog('setup:error', {
+          name: err?.name,
+          message: getErrorMessage(err, 'Could not start the video call.'),
+          status: err?.response?.status,
+          detail: err?.response?.data,
+        });
         console.error('Call setup error:', err);
         if (isMounted) {
           setCallError(getErrorMessage(err, 'Could not start the video call. Camera, microphone, or network setup is blocking it.'));
@@ -1932,6 +2132,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
     return () => {
       isMounted = false;
+      debugLog('setup:cleanup', { provider: callProviderRef.current });
       pendingIceCandidatesRef.current = [];
       if (callProviderRef.current === 'daily' && dailyCallRef.current) {
         try {
@@ -1966,7 +2167,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         socketRef.current = null;
       }
     };
-  }, [user, matchedUser, callId, isInitiator, handleEndCall, syncDailyParticipantMedia, attachVideoElementStream]);
+  }, [user, matchedUser, callId, isInitiator, mode, handleEndCall, syncDailyParticipantMedia, attachVideoElementStream, debugLog]);
 
   const toggleMute = () => {
     const nextMuted = !isMuted;
