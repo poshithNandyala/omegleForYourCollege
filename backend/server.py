@@ -14,6 +14,7 @@ from typing import Optional, List, Dict, Any, Literal
 from contextlib import asynccontextmanager
 
 import bcrypt
+import httpx
 import jwt
 import resend
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -108,6 +109,7 @@ REDIS_URL = os.environ.get("REDIS_URL")
 REDIS_NAMESPACE = os.environ.get("REDIS_NAMESPACE", "campuslink")
 REQUIRE_REDIS_IN_PRODUCTION = parse_bool_env("REQUIRE_REDIS_IN_PRODUCTION", True)
 REQUIRE_TURN_IN_PRODUCTION = parse_bool_env("REQUIRE_TURN_IN_PRODUCTION", True)
+DAILY_ENABLED = parse_bool_env("DAILY_ENABLED", False)
 STUN_URLS = parse_csv_env(
     "STUN_URLS",
     "stun:stun.l.google.com:19302,stun:stun1.l.google.com:19302"
@@ -115,6 +117,11 @@ STUN_URLS = parse_csv_env(
 TURN_URLS = parse_csv_env("TURN_URL")
 TURN_USERNAME = os.environ.get("TURN_USERNAME")
 TURN_CREDENTIAL = os.environ.get("TURN_CREDENTIAL")
+DAILY_API_KEY = os.environ.get("DAILY_API_KEY")
+DAILY_DOMAIN = strip_wrapping_quotes(os.environ.get("DAILY_DOMAIN", "")).rstrip("/")
+DAILY_ROOM_PRIVACY = strip_wrapping_quotes(os.environ.get("DAILY_ROOM_PRIVACY", "private")).lower() or "private"
+DAILY_ROOM_EXP_MINUTES = int(os.environ.get("DAILY_ROOM_EXP_MINUTES", "30"))
+DAILY_SFU_SWITCHOVER = float(os.environ.get("DAILY_SFU_SWITCHOVER", "0.5"))
 CORS_ORIGINS = parse_csv_env(
     "CORS_ORIGINS",
     "http://localhost:3000,http://127.0.0.1:3000,http://localhost:8001,http://127.0.0.1:8001"
@@ -151,6 +158,8 @@ if COOKIE_DOMAIN:
     REFRESH_COOKIE_KWARGS["domain"] = COOKIE_DOMAIN
 
 TURN_ENABLED = bool(TURN_URLS and TURN_USERNAME and TURN_CREDENTIAL)
+DAILY_READY = bool(DAILY_ENABLED and DAILY_API_KEY and DAILY_DOMAIN)
+DAILY_API_BASE_URL = "https://api.daily.co/v1"
 
 RATE_LIMITS = {
     "auth_send_otp": (3, OTP_RATE_LIMIT_WINDOW_MINUTES * 60),
@@ -405,6 +414,112 @@ def online_user_counts_key() -> str:
 
 def turn_required() -> bool:
     return APP_ENV == "production" and REQUIRE_TURN_IN_PRODUCTION
+
+
+def call_provider_ready() -> bool:
+    return DAILY_READY or TURN_ENABLED
+
+
+def preferred_call_provider() -> str:
+    return "daily" if DAILY_READY else "webrtc"
+
+
+def build_daily_domain_url() -> str:
+    if not DAILY_DOMAIN:
+        return ""
+    if DAILY_DOMAIN.startswith(("http://", "https://")):
+        return DAILY_DOMAIN.rstrip("/")
+    return f"https://{DAILY_DOMAIN}".rstrip("/")
+
+
+def build_daily_room_name(call_id: str) -> str:
+    suffix = re.sub(r"[^a-zA-Z0-9_-]", "-", call_id).lower()
+    return f"campuslink-{suffix}"
+
+
+def build_daily_room_url(room_name: str) -> str:
+    return f"{build_daily_domain_url()}/{room_name}"
+
+
+async def create_daily_room(call_id: str) -> Dict[str, Any]:
+    room_name = build_daily_room_name(call_id)
+    payload = {
+        "name": room_name,
+        "privacy": DAILY_ROOM_PRIVACY,
+        "properties": {
+            "exp": int((utcnow() + timedelta(minutes=DAILY_ROOM_EXP_MINUTES)).timestamp()),
+            "sfu_switchover": DAILY_SFU_SWITCHOVER,
+        },
+    }
+    headers = {"Authorization": f"Bearer {DAILY_API_KEY}"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client_http:
+        response = await client_http.post(f"{DAILY_API_BASE_URL}/rooms", json=payload, headers=headers)
+        if response.status_code not in {200, 201, 409}:
+            detail = response.text.strip() or "Could not create Daily room."
+            raise HTTPException(status_code=502, detail=f"Daily room error: {detail}")
+        if response.status_code == 409:
+            response = await client_http.get(f"{DAILY_API_BASE_URL}/rooms/{room_name}", headers=headers)
+            if response.status_code != 200:
+                detail = response.text.strip() or "Could not fetch existing Daily room."
+                raise HTTPException(status_code=502, detail=f"Daily room lookup error: {detail}")
+
+    room = response.json()
+    room_url = room.get("url") or build_daily_room_url(room_name)
+    return {
+        "name": room.get("name") or room_name,
+        "url": room_url,
+    }
+
+
+async def create_daily_meeting_token(room_name: str, user: Dict[str, Any]) -> str:
+    payload = {
+        "properties": {
+            "room_name": room_name,
+            "user_name": user.get("name") or user["user_id"],
+            "user_id": user["user_id"],
+            "exp": int((utcnow() + timedelta(minutes=DAILY_ROOM_EXP_MINUTES)).timestamp()),
+        }
+    }
+    headers = {"Authorization": f"Bearer {DAILY_API_KEY}"}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client_http:
+        response = await client_http.post(f"{DAILY_API_BASE_URL}/meeting-tokens", json=payload, headers=headers)
+    if response.status_code not in {200, 201}:
+        detail = response.text.strip() or "Could not create Daily meeting token."
+        raise HTTPException(status_code=502, detail=f"Daily token error: {detail}")
+
+    token = response.json().get("token")
+    if not token:
+        raise HTTPException(status_code=502, detail="Daily token response was empty.")
+    return token
+
+
+async def ensure_daily_call_session(call: Dict[str, Any], user: Dict[str, Any]) -> Dict[str, Any]:
+    room_name = call.get("provider_room_name")
+    room_url = call.get("provider_room_url")
+    if not room_name or not room_url:
+        room = await create_daily_room(call["call_id"])
+        room_name = room["name"]
+        room_url = room["url"]
+        await db.call_history.update_one(
+            {"call_id": call["call_id"]},
+            {
+                "$set": {
+                    "provider": "daily",
+                    "provider_room_name": room_name,
+                    "provider_room_url": room_url,
+                    "updated_at": utcnow(),
+                }
+            },
+        )
+
+    token = await create_daily_meeting_token(room_name, user)
+    return {
+        "provider": "daily",
+        "room_name": room_name,
+        "room_url": room_url,
+        "token": token,
+        "domain": build_daily_domain_url(),
+    }
 
 
 def json_dumps(data: Dict[str, Any]) -> str:
@@ -906,8 +1021,8 @@ def validate_runtime_configuration() -> None:
     if APP_ENV == "production" and REQUIRE_REDIS_IN_PRODUCTION and not REDIS_URL:
         raise RuntimeError("REDIS_URL is required in production.")
 
-    if turn_required() and not TURN_ENABLED:
-        raise RuntimeError("TURN_URL, TURN_USERNAME, and TURN_CREDENTIAL are required in production.")
+    if turn_required() and not call_provider_ready():
+        raise RuntimeError("Configure either Daily or TURN before enabling production calls.")
 
     if APP_ENV != "development" and len(JWT_SECRET) < 32:
         logger.warning("JWT_SECRET should be at least 32 characters outside development.")
@@ -1889,6 +2004,39 @@ async def get_call_history(request: Request):
     
     return {"calls": calls}
 
+
+@app.get("/api/calls/session/{call_id}")
+async def get_call_session(call_id: str, request: Request):
+    user = await get_current_user(request)
+    call = await db.call_history.find_one({"call_id": call_id}, {"_id": 0})
+    if not call:
+        raise HTTPException(status_code=404, detail="Call not found")
+
+    participants = call.get("participants", [])
+    if user["user_id"] not in participants:
+        raise HTTPException(status_code=403, detail="You are not part of this call")
+
+    other_user_id = next((participant for participant in participants if participant != user["user_id"]), None)
+    if other_user_id:
+        await enforce_not_blocked(user["user_id"], other_user_id)
+
+    if DAILY_READY:
+        session = await ensure_daily_call_session(call, user)
+        return {
+            "provider": "daily",
+            "room_name": session["room_name"],
+            "room_url": session["room_url"],
+            "token": session["token"],
+            "domain": session["domain"],
+        }
+
+    return {
+        "provider": "webrtc",
+        "ice_servers": build_ice_servers(),
+        "turn_enabled": TURN_ENABLED,
+        "turn_required": turn_required(),
+    }
+
 # ============ MATCHING ENDPOINTS ============
 
 @app.post("/api/match/find")
@@ -1901,8 +2049,8 @@ async def find_match_endpoint(data: ConnectRequest, request: Request):
         override_message="Too many match attempts. Please wait a moment.",
     )
 
-    if turn_required() and not TURN_ENABLED:
-        raise HTTPException(status_code=503, detail="TURN relay is required before matching is available in production.")
+    if turn_required() and not call_provider_ready():
+        raise HTTPException(status_code=503, detail="A realtime call provider must be configured before matching is available in production.")
 
     user_id = user["user_id"]
     college = user.get("college", "")
@@ -2541,6 +2689,8 @@ async def get_rtc_config():
         "ice_servers": build_ice_servers(),
         "turn_enabled": TURN_ENABLED,
         "turn_required": turn_required(),
+        "daily_enabled": DAILY_READY,
+        "call_provider": preferred_call_provider(),
     }
 
 @app.get("/api/health")
@@ -2548,7 +2698,7 @@ async def health_check():
     db_connected = await ping_database()
     redis_connected = await ping_redis() if REDIS_URL else False
     online_count = await get_online_user_count()
-    service_ready = db_connected and (not REDIS_URL or redis_connected) and (not turn_required() or TURN_ENABLED)
+    service_ready = db_connected and (not REDIS_URL or redis_connected) and (not turn_required() or call_provider_ready())
 
     return {
         "status": "healthy" if service_ready else "degraded",
@@ -2558,6 +2708,8 @@ async def health_check():
         "same_wifi_strategy": "multi_bucket_ip_plus_browser_fingerprint",
         "turn_enabled": TURN_ENABLED,
         "turn_required": turn_required(),
+        "daily_enabled": DAILY_READY,
+        "call_provider": preferred_call_provider(),
         "database_connected": db_connected,
         "database_error": db_last_error,
         "redis_connected": redis_connected,
