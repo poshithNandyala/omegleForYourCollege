@@ -1500,9 +1500,12 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
   const [callStatus, setCallStatus] = useState('Preparing secure call...');
   const [remoteVideoReady, setRemoteVideoReady] = useState(false);
   const [unreadMessages, setUnreadMessages] = useState(0);
+  const [providerOverride, setProviderOverride] = useState(null);
   const localVideoRef = useRef(null);
   const remoteVideoRef = useRef(null);
   const chatOpenRef = useRef(chatOpen);
+  const remoteVideoReadyRef = useRef(false);
+  const fallbackTimeoutRef = useRef(null);
   const remoteStreamRef = useRef(null);
   const peerConnectionRef = useRef(null);
   const socketRef = useRef(null);
@@ -1586,6 +1589,19 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
     chatOpenRef.current = chatOpen;
   }, [chatOpen]);
 
+  useEffect(() => {
+    remoteVideoReadyRef.current = remoteVideoReady;
+  }, [remoteVideoReady]);
+
+  useEffect(() => {
+    remoteVideoReadyRef.current = false;
+    setProviderOverride(null);
+    if (fallbackTimeoutRef.current) {
+      window.clearTimeout(fallbackTimeoutRef.current);
+      fallbackTimeoutRef.current = null;
+    }
+  }, [callId]);
+
   const attachVideoElementStream = useCallback((videoElement, stream, { muted = false } = {}) => {
     if (!videoElement) {
       return;
@@ -1659,6 +1675,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           matchedUserName: matchedUser.name,
           mode,
           isInitiator,
+          providerOverride,
         });
         remoteReadyRef.current = false;
         offerStartedRef.current = false;
@@ -1666,14 +1683,24 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         callProviderRef.current = 'webrtc';
         setCallStatus('Connecting to live call...');
         setRemoteVideoReady(false);
+        remoteVideoReadyRef.current = false;
         setCallError('');
         pendingIceCandidatesRef.current = [];
+        if (fallbackTimeoutRef.current) {
+          window.clearTimeout(fallbackTimeoutRef.current);
+          fallbackTimeoutRef.current = null;
+        }
         remoteStreamRef.current = null;
         attachVideoElementStream(remoteVideoRef.current, null);
 
-        const callSessionPromise = axios.get(`/api/calls/session/${callId}`).then(({ data }) => {
+        const callSessionPromise = axios.get(`/api/calls/session/${callId}`, {
+          params: providerOverride ? { provider: providerOverride } : undefined,
+        }).then(({ data }) => {
           debugLog('session:received', {
             provider: data.provider,
+            requested_provider: providerOverride,
+            mode: data.mode,
+            daily_enabled: data.daily_enabled,
             room_url: data.room_url,
             token_present: Boolean(data.token),
             turn_enabled: data.turn_enabled,
@@ -1790,6 +1817,29 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           return;
         }
 
+        const callMode = callSession.mode || mode;
+        const canFallbackToDaily = Boolean(callSession.daily_enabled) && ['same_college', 'same_wifi'].includes(callMode);
+        let fallbackTriggered = false;
+        const triggerDailyFallback = (reason, details = {}) => {
+          if (!isMounted || providerOverride === 'daily' || fallbackTriggered || !canFallbackToDaily) {
+            return false;
+          }
+          fallbackTriggered = true;
+          if (fallbackTimeoutRef.current) {
+            window.clearTimeout(fallbackTimeoutRef.current);
+            fallbackTimeoutRef.current = null;
+          }
+          debugLog('fallback:daily-requested', {
+            reason,
+            mode: callMode,
+            ...details,
+          });
+          setCallError('');
+          setCallStatus('Trying Daily relay...');
+          setProviderOverride('daily');
+          return true;
+        };
+
         if (callSession.provider === 'daily') {
           callProviderRef.current = 'daily';
           debugLog('daily:init', {
@@ -1875,12 +1925,16 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           ? callSession
           : await getRtcConfig();
         debugLog('webrtc:init', {
+          mode: callMode,
+          canFallbackToDaily,
           turn_required: rtcConfig.turn_required,
           turn_enabled: rtcConfig.turn_enabled,
           ice_servers: rtcConfig.ice_servers,
         });
         if (rtcConfig.turn_required && !rtcConfig.turn_enabled) {
-          throw new Error('TURN relay is required before calls can start in production.');
+          debugLog('webrtc:turn-unavailable-continuing', {
+            mode: callMode,
+          });
         }
 
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -1963,6 +2017,16 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         debugLog('webrtc:tracks-added', {
           tracks: stream.getTracks().map(summarizeTrack),
         });
+        if (canFallbackToDaily) {
+          fallbackTimeoutRef.current = window.setTimeout(() => {
+            if (!remoteVideoReadyRef.current && callProviderRef.current === 'webrtc') {
+              triggerDailyFallback('remote_video_timeout', {
+                connectionState: peerConnectionRef.current?.connectionState,
+                iceConnectionState: peerConnectionRef.current?.iceConnectionState,
+              });
+            }
+          }, 12000);
+        }
 
         peerConnectionRef.current.ontrack = (event) => {
           debugLog('webrtc:ontrack', {
@@ -1982,6 +2046,11 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
           if (event.track.kind === 'video') {
             const markRemoteVideoReady = () => {
+              remoteVideoReadyRef.current = true;
+              if (fallbackTimeoutRef.current) {
+                window.clearTimeout(fallbackTimeoutRef.current);
+                fallbackTimeoutRef.current = null;
+              }
               setRemoteVideoReady(true);
               setCallStatus('Connected');
               ensureVideoPlayback(remoteVideoRef.current);
@@ -1997,6 +2066,9 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         peerConnectionRef.current.onconnectionstatechange = () => {
           const state = peerConnectionRef.current?.connectionState;
           debugLog('webrtc:connection-state', { state });
+          if (state === 'failed' && triggerDailyFallback('connection_state_failed', { state })) {
+            return;
+          }
           if (state === 'connected') {
             setCallStatus('Connected');
           } else if (state === 'connecting') {
@@ -2011,6 +2083,9 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         peerConnectionRef.current.oniceconnectionstatechange = () => {
           const iceState = peerConnectionRef.current?.iceConnectionState;
           debugLog('webrtc:ice-connection-state', { iceState });
+          if (iceState === 'failed' && triggerDailyFallback('ice_connection_failed', { iceState })) {
+            return;
+          }
           if (iceState === 'checking') {
             setCallStatus('Checking network route...');
           } else if (iceState === 'connected' || iceState === 'completed') {
@@ -2133,6 +2208,10 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
     return () => {
       isMounted = false;
       debugLog('setup:cleanup', { provider: callProviderRef.current });
+      if (fallbackTimeoutRef.current) {
+        window.clearTimeout(fallbackTimeoutRef.current);
+        fallbackTimeoutRef.current = null;
+      }
       pendingIceCandidatesRef.current = [];
       if (callProviderRef.current === 'daily' && dailyCallRef.current) {
         try {
@@ -2167,7 +2246,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         socketRef.current = null;
       }
     };
-  }, [user, matchedUser, callId, isInitiator, mode, handleEndCall, syncDailyParticipantMedia, attachVideoElementStream, debugLog]);
+  }, [user, matchedUser, callId, isInitiator, mode, providerOverride, handleEndCall, syncDailyParticipantMedia, attachVideoElementStream, debugLog]);
 
   const toggleMute = () => {
     const nextMuted = !isMuted;

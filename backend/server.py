@@ -416,12 +416,31 @@ def turn_required() -> bool:
     return APP_ENV == "production" and REQUIRE_TURN_IN_PRODUCTION
 
 
-def call_provider_ready() -> bool:
-    return DAILY_READY or TURN_ENABLED
+def call_mode_prefers_daily(mode: Optional[str]) -> bool:
+    return (mode or "").strip().lower() in {"cross_college", "friend"}
 
 
-def preferred_call_provider() -> str:
-    return "daily" if DAILY_READY else "webrtc"
+def preferred_call_provider(mode: Optional[str] = None) -> str:
+    if DAILY_READY and call_mode_prefers_daily(mode):
+        return "daily"
+    return "webrtc"
+
+
+def resolve_call_provider(mode: Optional[str], requested_provider: Optional[str] = None) -> str:
+    normalized_provider = (requested_provider or "").strip().lower()
+    if normalized_provider == "daily":
+        if not DAILY_READY:
+            raise HTTPException(status_code=503, detail="Daily is not configured for this deployment.")
+        return "daily"
+    if normalized_provider == "webrtc":
+        return "webrtc"
+    return preferred_call_provider(mode)
+
+
+def call_provider_strategy() -> str:
+    if DAILY_READY:
+        return "webrtc_for_same_modes_with_daily_fallback_daily_for_cross_modes"
+    return "webrtc_only"
 
 
 def build_daily_domain_url() -> str:
@@ -1020,9 +1039,6 @@ def validate_runtime_configuration() -> None:
 
     if APP_ENV == "production" and REQUIRE_REDIS_IN_PRODUCTION and not REDIS_URL:
         raise RuntimeError("REDIS_URL is required in production.")
-
-    if turn_required() and not call_provider_ready():
-        raise RuntimeError("Configure either Daily or TURN before enabling production calls.")
 
     if APP_ENV != "development" and len(JWT_SECRET) < 32:
         logger.warning("JWT_SECRET should be at least 32 characters outside development.")
@@ -2006,7 +2022,7 @@ async def get_call_history(request: Request):
 
 
 @app.get("/api/calls/session/{call_id}")
-async def get_call_session(call_id: str, request: Request):
+async def get_call_session(call_id: str, request: Request, provider: Optional[str] = None):
     user = await get_current_user(request)
     call = await db.call_history.find_one({"call_id": call_id}, {"_id": 0})
     if not call:
@@ -2020,10 +2036,13 @@ async def get_call_session(call_id: str, request: Request):
     if other_user_id:
         await enforce_not_blocked(user["user_id"], other_user_id)
 
-    if DAILY_READY:
+    resolved_provider = resolve_call_provider(call.get("mode"), provider)
+    if resolved_provider == "daily":
         session = await ensure_daily_call_session(call, user)
         return {
             "provider": "daily",
+            "mode": call.get("mode"),
+            "daily_enabled": DAILY_READY,
             "room_name": session["room_name"],
             "room_url": session["room_url"],
             "token": session["token"],
@@ -2032,6 +2051,8 @@ async def get_call_session(call_id: str, request: Request):
 
     return {
         "provider": "webrtc",
+        "mode": call.get("mode"),
+        "daily_enabled": DAILY_READY,
         "ice_servers": build_ice_servers(),
         "turn_enabled": TURN_ENABLED,
         "turn_required": turn_required(),
@@ -2048,9 +2069,6 @@ async def find_match_endpoint(data: ConnectRequest, request: Request):
         limit_name="match_find",
         override_message="Too many match attempts. Please wait a moment.",
     )
-
-    if turn_required() and not call_provider_ready():
-        raise HTTPException(status_code=503, detail="A realtime call provider must be configured before matching is available in production.")
 
     user_id = user["user_id"]
     college = user.get("college", "")
@@ -2690,7 +2708,7 @@ async def get_rtc_config():
         "turn_enabled": TURN_ENABLED,
         "turn_required": turn_required(),
         "daily_enabled": DAILY_READY,
-        "call_provider": preferred_call_provider(),
+        "call_provider": call_provider_strategy(),
     }
 
 @app.get("/api/health")
@@ -2698,7 +2716,7 @@ async def health_check():
     db_connected = await ping_database()
     redis_connected = await ping_redis() if REDIS_URL else False
     online_count = await get_online_user_count()
-    service_ready = db_connected and (not REDIS_URL or redis_connected) and (not turn_required() or call_provider_ready())
+    service_ready = db_connected and (not REDIS_URL or redis_connected)
 
     return {
         "status": "healthy" if service_ready else "degraded",
@@ -2709,7 +2727,7 @@ async def health_check():
         "turn_enabled": TURN_ENABLED,
         "turn_required": turn_required(),
         "daily_enabled": DAILY_READY,
-        "call_provider": preferred_call_provider(),
+        "call_provider": call_provider_strategy(),
         "database_connected": db_connected,
         "database_error": db_last_error,
         "redis_connected": redis_connected,
