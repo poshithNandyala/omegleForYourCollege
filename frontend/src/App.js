@@ -1416,6 +1416,7 @@ const NetworkTestCard = () => {
         serverError: serverCheck?.error || null,
         checkerVersion: serverOk ? serverCheck.checker_version : null,
         credentialsSource: (serverOk && serverCheck.credentials_source) || config.credentials_source || null,
+        meteredError: (serverOk && serverCheck.metered_error) || null,
         serverResults: serverOk && Array.isArray(serverCheck.results) ? serverCheck.results : null,
       });
     } catch (error) {
@@ -1529,7 +1530,7 @@ const NetworkTestCard = () => {
               {result.credentialsSource === 'static_env' && (
                 <p className="mb-2 text-xs font-bold text-red-600">
                   Metered API credentials are NOT active — the server fell back to static env vars.
-                  Check METERED_APP_NAME and METERED_API_KEY.
+                  {result.meteredError ? ` Reason: ${result.meteredError}` : ' Check METERED_APP_NAME and METERED_API_KEY.'}
                 </p>
               )}
               {result.serverResults?.map((serverResult) => (
