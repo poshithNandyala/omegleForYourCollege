@@ -125,6 +125,12 @@ STUN_URLS = parse_csv_env(
 TURN_URLS = parse_csv_env("TURN_URL")
 TURN_USERNAME = os.environ.get("TURN_USERNAME")
 TURN_CREDENTIAL = os.environ.get("TURN_CREDENTIAL")
+# Easiest TURN setup: set METERED_APP_NAME (the <app> in <app>.metered.live)
+# and METERED_API_KEY, and the backend fetches always-valid TURN credentials
+# from Metered's API — no manual TURN_USERNAME/TURN_CREDENTIAL copying.
+METERED_APP_NAME = strip_wrapping_quotes(os.environ.get("METERED_APP_NAME", "")).strip()
+METERED_API_KEY = strip_wrapping_quotes(os.environ.get("METERED_API_KEY", "")).strip()
+ICE_CACHE_TTL_SECONDS = int(os.environ.get("ICE_CACHE_TTL_SECONDS", "3600"))
 DAILY_API_KEY = os.environ.get("DAILY_API_KEY")
 DAILY_DOMAIN = strip_wrapping_quotes(os.environ.get("DAILY_DOMAIN", "")).rstrip("/")
 DAILY_ROOM_PRIVACY = strip_wrapping_quotes(os.environ.get("DAILY_ROOM_PRIVACY", "private")).lower() or "private"
@@ -1194,6 +1200,56 @@ def build_ice_servers() -> List[Dict[str, Any]]:
             }
         )
     return ice_servers
+
+
+METERED_READY = bool(METERED_APP_NAME and METERED_API_KEY)
+_metered_ice_cache: Dict[str, Any] = {"servers": None, "expires_at": 0.0}
+
+
+async def fetch_metered_ice_servers() -> Optional[List[Dict[str, Any]]]:
+    """Fetch fresh TURN credentials from Metered's API, cached for a while."""
+    if not METERED_READY:
+        return None
+
+    now = time.monotonic()
+    if _metered_ice_cache["servers"] is not None and _metered_ice_cache["expires_at"] > now:
+        return _metered_ice_cache["servers"]
+    if _metered_ice_cache["servers"] is None and _metered_ice_cache["expires_at"] > now:
+        return None  # negative cache after a recent failure
+
+    url = f"https://{METERED_APP_NAME}.metered.live/api/v1/turn/credentials"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client_http:
+            response = await client_http.get(url, params={"apiKey": METERED_API_KEY})
+        if response.status_code == 200:
+            servers = response.json()
+            if isinstance(servers, list) and servers:
+                _metered_ice_cache["servers"] = servers
+                _metered_ice_cache["expires_at"] = now + ICE_CACHE_TTL_SECONDS
+                return servers
+        logger.warning("Metered credential fetch failed: HTTP %s %s", response.status_code, response.text[:200])
+    except Exception as exc:
+        logger.warning("Metered credential fetch error: %s", exc)
+
+    _metered_ice_cache["servers"] = None
+    _metered_ice_cache["expires_at"] = now + 60  # retry after a minute
+    return None
+
+
+async def resolve_ice_configuration() -> Dict[str, Any]:
+    """Best available ICE servers: Metered API first, static env fallback."""
+    metered_servers = await fetch_metered_ice_servers()
+    if metered_servers:
+        return {
+            "ice_servers": metered_servers,
+            "turn_enabled": True,
+            "credentials_source": "metered_api",
+        }
+    return {
+        "ice_servers": build_ice_servers(),
+        "turn_enabled": TURN_ENABLED,
+        "credentials_source": "static_env",
+    }
 
 # ---- STUN/TURN health probes (minimal RFC 5389 / RFC 5766 client) ----
 # Used by /api/turn-check to prove, from this server's network, that the
@@ -2349,12 +2405,13 @@ async def get_call_session(call_id: str, request: Request, provider: Optional[st
             "domain": session["domain"],
         }
 
+    ice_configuration = await resolve_ice_configuration()
     return {
         "provider": "webrtc",
         "mode": call.get("mode"),
         "daily_enabled": DAILY_READY,
-        "ice_servers": build_ice_servers(),
-        "turn_enabled": TURN_ENABLED,
+        "ice_servers": ice_configuration["ice_servers"],
+        "turn_enabled": ice_configuration["turn_enabled"],
         "turn_required": turn_required(),
     }
 
@@ -3038,16 +3095,35 @@ async def turn_check(request: Request):
         override_message="Too many connectivity checks. Try again in a few minutes.",
     )
 
-    checks = [check_stun_url(url) for url in STUN_URLS[:2]]
-    if TURN_ENABLED:
-        checks.extend(check_turn_url(url, TURN_USERNAME, TURN_CREDENTIAL) for url in TURN_URLS)
+    ice_configuration = await resolve_ice_configuration()
+    stun_targets: List[str] = []
+    turn_targets: List[tuple] = []
+    for server in ice_configuration["ice_servers"]:
+        urls = server.get("urls")
+        url_list = urls if isinstance(urls, list) else [urls]
+        for server_url in url_list:
+            if not server_url:
+                continue
+            if server_url.startswith("stun:"):
+                stun_targets.append(server_url)
+            elif server_url.startswith(("turn:", "turns:")):
+                turn_targets.append(
+                    (server_url, server.get("username", ""), server.get("credential", ""))
+                )
+
+    checks = [check_stun_url(url) for url in stun_targets[:2]]
+    checks.extend(
+        check_turn_url(url, username, credential)
+        for url, username, credential in turn_targets[:6]
+    )
     results = await asyncio.gather(*checks)
 
     turn_results = [result for result in results if result["kind"] == "turn"]
     stun_results = [result for result in results if result["kind"] == "stun"]
     return {
-        "checker_version": 2,
-        "turn_enabled": TURN_ENABLED,
+        "checker_version": 3,
+        "credentials_source": ice_configuration["credentials_source"],
+        "turn_enabled": ice_configuration["turn_enabled"],
         "turn_working": any(result["ok"] for result in turn_results) if turn_results else False,
         "stun_working": any(result["ok"] for result in stun_results) if stun_results else False,
         "results": results,
@@ -3057,9 +3133,11 @@ async def turn_check(request: Request):
 
 @app.get("/api/rtc-config")
 async def get_rtc_config():
+    ice_configuration = await resolve_ice_configuration()
     return {
-        "ice_servers": build_ice_servers(),
-        "turn_enabled": TURN_ENABLED,
+        "ice_servers": ice_configuration["ice_servers"],
+        "turn_enabled": ice_configuration["turn_enabled"],
+        "credentials_source": ice_configuration["credentials_source"],
         "turn_required": turn_required(),
         "daily_enabled": DAILY_READY,
         "call_provider": call_provider_strategy(),
@@ -3071,6 +3149,7 @@ async def health_check():
     redis_connected = await ping_redis() if REDIS_URL else False
     online_count = await get_online_user_count()
     service_ready = db_connected and (not REDIS_URL or redis_connected)
+    ice_configuration = await resolve_ice_configuration()
 
     return {
         "status": "healthy" if service_ready else "degraded",
@@ -3078,7 +3157,8 @@ async def health_check():
         "online_users": online_count,
         "environment": APP_ENV,
         "same_wifi_strategy": "multi_bucket_ip_plus_browser_fingerprint",
-        "turn_enabled": TURN_ENABLED,
+        "turn_enabled": ice_configuration["turn_enabled"],
+        "credentials_source": ice_configuration["credentials_source"],
         "turn_required": turn_required(),
         "daily_enabled": DAILY_READY,
         "call_provider": call_provider_strategy(),
