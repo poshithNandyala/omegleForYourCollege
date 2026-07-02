@@ -2,6 +2,14 @@
 
 CampusLink is a college-only video chat and networking app built with React, FastAPI, MongoDB, Socket.IO, and WebRTC.
 
+## Call Features
+
+- Random matching by college, network, or cross-college, with an Omegle-style **Next** button that skips straight into the next match (the skipped peer is auto-requeued too).
+- **Screen sharing** on desktop browsers (WebRTC `replaceTrack`, no renegotiation; Daily screen tracks on the fallback provider).
+- STUN-first connectivity with an automatic recovery ladder: ICE restart → TURN-only relay rebuild → Daily managed fallback, so strict campus NATs/firewalls still connect.
+- Live connection-quality badge (RTT + packet loss via `getStats`) and relay indicator.
+- In-call chat with unread counters, AI ice breakers, friend calls, block/report safety tools.
+
 ## Local Run
 
 Backend:

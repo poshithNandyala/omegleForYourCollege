@@ -99,6 +99,8 @@ COOKIE_SAMESITE = os.environ.get(
 COOKIE_DOMAIN = os.environ.get("COOKIE_DOMAIN")
 MATCH_PENDING_TTL_SECONDS = int(os.environ.get("MATCH_PENDING_TTL_SECONDS", "30"))
 MATCH_QUEUE_TTL_SECONDS = int(os.environ.get("MATCH_QUEUE_TTL_SECONDS", "90"))
+BLOCK_CACHE_TTL_SECONDS = int(os.environ.get("BLOCK_CACHE_TTL_SECONDS", "30"))
+BLOCK_CACHE_MAX_ENTRIES = int(os.environ.get("BLOCK_CACHE_MAX_ENTRIES", "50000"))
 OTP_VERIFICATION_TTL_MINUTES = int(os.environ.get("OTP_VERIFICATION_TTL_MINUTES", "30"))
 OTP_RATE_LIMIT_WINDOW_MINUTES = int(os.environ.get("OTP_RATE_LIMIT_WINDOW_MINUTES", "10"))
 OTP_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("OTP_RATE_LIMIT_MAX_REQUESTS", "3"))
@@ -166,17 +168,18 @@ RATE_LIMITS = {
     "auth_login": (10, 15 * 60),
     "profile_update": (10, 10 * 60),
     "friend_add": (20, 10 * 60),
-    "match_find": (90, 60),
-    "match_cancel": (30, 60),
+    "match_find": (240, 60),
+    "match_cancel": (60, 60),
     "report_create": (10, 60 * 60),
     "block_create": (30, 60 * 60),
     "friend_message": (60, 60),
     "socket_register": (10, 60),
     "socket_friend_call": (20, 60),
-    "socket_offer": (20, 60),
-    "socket_answer": (20, 60),
-    "socket_ice": (300, 60),
-    "socket_chat": (40, 60),
+    "socket_offer": (40, 60),
+    "socket_answer": (40, 60),
+    "socket_ice": (600, 60),
+    "socket_chat": (60, 60),
+    "socket_screen_share": (30, 60),
 }
 
 PROFILE_CONTACT_PATTERNS = [
@@ -346,8 +349,9 @@ sio = socketio.AsyncServer(
     async_mode='asgi',
     client_manager=socket_manager,
     cors_allowed_origins="*" if ALLOW_LAN_ORIGINS else CORS_ORIGINS,
-    ping_timeout=60,
-    ping_interval=25
+    ping_timeout=30,
+    ping_interval=25,
+    max_http_buffer_size=1_000_000,
 )
 
 # Matching queues
@@ -468,6 +472,7 @@ async def create_daily_room(call_id: str) -> Dict[str, Any]:
         "properties": {
             "exp": int((utcnow() + timedelta(minutes=DAILY_ROOM_EXP_MINUTES)).timestamp()),
             "sfu_switchover": DAILY_SFU_SWITCHOVER,
+            "enable_screenshare": True,
         },
     }
     headers = {"Authorization": f"Bearer {DAILY_API_KEY}"}
@@ -666,6 +671,33 @@ async def are_users_blocked(user_id: str, other_user_id: str) -> bool:
         {"_id": 1},
     )
     return blocked is not None
+
+
+# Short-lived per-instance cache so high-frequency signaling relays (ICE
+# candidates, offers, chat) do not hit MongoDB on every packet.
+block_pair_cache: Dict[str, tuple[float, bool]] = {}
+
+
+def block_pair_cache_key(user_id: str, other_user_id: str) -> str:
+    first, second = sorted((user_id, other_user_id))
+    return f"{first}|{second}"
+
+
+def set_block_pair_cache(user_id: str, other_user_id: str, blocked: bool) -> None:
+    if len(block_pair_cache) >= BLOCK_CACHE_MAX_ENTRIES:
+        block_pair_cache.clear()
+    expires_at = utcnow().timestamp() + BLOCK_CACHE_TTL_SECONDS
+    block_pair_cache[block_pair_cache_key(user_id, other_user_id)] = (expires_at, blocked)
+
+
+async def are_users_blocked_cached(user_id: str, other_user_id: str) -> bool:
+    cached = block_pair_cache.get(block_pair_cache_key(user_id, other_user_id))
+    if cached and cached[0] > utcnow().timestamp():
+        return cached[1]
+
+    blocked = await are_users_blocked(user_id, other_user_id)
+    set_block_pair_cache(user_id, other_user_id, blocked)
+    return blocked
 
 
 async def enforce_not_blocked(user_id: str, other_user_id: str) -> None:
@@ -1938,6 +1970,7 @@ async def block_user(data: BlockUserRequest, request: Request):
     except DuplicateKeyError:
         return {"status": "success", "message": "User already blocked"}
 
+    set_block_pair_cache(user["user_id"], data.target_user_id, True)
     await remove_user_from_queues(user["user_id"])
     await remove_user_from_queues(data.target_user_id)
     await discard_pending_match(user["user_id"])
@@ -1950,6 +1983,7 @@ async def block_user(data: BlockUserRequest, request: Request):
 async def unblock_user(target_user_id: str, request: Request):
     user = await get_current_user(request)
     await db.blocks.delete_one({"user_id": user["user_id"], "blocked_user_id": target_user_id})
+    block_pair_cache.pop(block_pair_cache_key(user["user_id"], target_user_id), None)
     return {"status": "success", "message": "User unblocked"}
 
 
@@ -1994,6 +2028,7 @@ async def report_user(data: ReportUserRequest, request: Request):
             )
         except DuplicateKeyError:
             pass
+        set_block_pair_cache(user["user_id"], data.reported_user_id, True)
 
     return {"status": "success", "message": "Report submitted"}
 
@@ -2402,7 +2437,7 @@ async def call_ready(sid, data):
     call_id = data.get("call_id")
     if not target_id or not call_id:
         return
-    if await are_users_blocked(user_id, target_id):
+    if await are_users_blocked_cached(user_id, target_id):
         await sio.emit("error", {"detail": "You cannot connect to this user."}, to=sid)
         return
 
@@ -2451,7 +2486,7 @@ async def friend_call_invite(sid, data):
     if not await are_friends(user_id, target_id):
         await sio.emit("error", {"detail": "You can only call friends."}, to=sid)
         return
-    if await are_users_blocked(user_id, target_id):
+    if await are_users_blocked_cached(user_id, target_id):
         await sio.emit("error", {"detail": "This call is unavailable due to a block."}, to=sid)
         return
 
@@ -2511,7 +2546,7 @@ async def friend_call_accept(sid, data):
     if not await are_friends(user_id, target_id):
         await sio.emit("error", {"detail": "You can only call friends."}, to=sid)
         return
-    if await are_users_blocked(user_id, target_id):
+    if await are_users_blocked_cached(user_id, target_id):
         await sio.emit("error", {"detail": "This call is unavailable due to a block."}, to=sid)
         return
 
@@ -2577,7 +2612,7 @@ async def offer(sid, data):
     target_id = data.get("target_id")
     if not target_id:
         return
-    if await are_users_blocked(user_id, target_id):
+    if await are_users_blocked_cached(user_id, target_id):
         await sio.emit("error", {"detail": "You cannot call this user."}, to=sid)
         return
 
@@ -2600,7 +2635,7 @@ async def answer(sid, data):
     target_id = data.get("target_id")
     if not target_id:
         return
-    if await are_users_blocked(user_id, target_id):
+    if await are_users_blocked_cached(user_id, target_id):
         await sio.emit("error", {"detail": "You cannot answer this user."}, to=sid)
         return
 
@@ -2623,13 +2658,35 @@ async def ice_candidate(sid, data):
     target_id = data.get("target_id")
     if not target_id:
         return
-    if await are_users_blocked(user_id, target_id):
+    if await are_users_blocked_cached(user_id, target_id):
         return
 
     await sio.emit("ice_candidate", {
         "candidate": data.get("candidate"),
         "from_id": user_id,
         "call_id": data.get("call_id"),
+    }, room=user_room(target_id))
+
+@sio.event
+async def screen_share(sid, data):
+    """Relay screen-share start/stop status to the call peer."""
+    user_id = await get_socket_user_id(sid)
+    if not user_id:
+        await sio.emit("error", {"detail": "Socket is not registered."}, to=sid)
+        return
+    if await socket_rate_limited(sid, f"socket-screen:{user_id}", "socket_screen_share", "Too many screen share toggles."):
+        return
+
+    target_id = data.get("target_id")
+    if not target_id:
+        return
+    if await are_users_blocked_cached(user_id, target_id):
+        return
+
+    await sio.emit("screen_share", {
+        "from_id": user_id,
+        "call_id": data.get("call_id"),
+        "active": bool(data.get("active")),
     }, room=user_room(target_id))
 
 @sio.event
@@ -2674,7 +2731,7 @@ async def chat_message(sid, data):
     message = (data.get("message") or "").strip()
     if not target_id or not message:
         return
-    if await are_users_blocked(user_id, target_id):
+    if await are_users_blocked_cached(user_id, target_id):
         await sio.emit("error", {"detail": "This chat is unavailable due to a block."}, to=sid)
         return
 

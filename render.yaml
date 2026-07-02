@@ -9,7 +9,7 @@ services:
     plan: standard
     rootDir: backend
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT --loop uvloop --http httptools --no-access-log --timeout-keep-alive 75
     autoDeployTrigger: commit
     healthCheckPath: /api/health
     numInstances: 2

@@ -8,7 +8,8 @@ import {
   MessageSquare, UserPlus, History, Settings, LogOut,
   Wifi, Building2, Globe, Heart, Briefcase, BookOpen,
   Sparkles, Send, X, Check, Loader2, ChevronRight,
-  ShieldAlert, Ban, Flag, Bell, Radio
+  ShieldAlert, Ban, Flag, Bell, Radio,
+  SkipForward, ScreenShare, ScreenShareOff, Activity
 } from 'lucide-react';
 
 const trimTrailingSlash = (value) => value.replace(/\/+$/, '');
@@ -417,6 +418,8 @@ const LandingPage = () => {
                 { icon: Wifi, text: 'Same Network', color: 'bg-accent-yellow' },
                 { icon: Globe, text: 'Cross College', color: 'bg-accent-lilac' },
                 { icon: Sparkles, text: 'AI Matching', color: 'bg-primary' },
+                { icon: ScreenShare, text: 'Screen Share', color: 'bg-accent-yellow' },
+                { icon: SkipForward, text: 'Instant Skip', color: 'bg-accent-mint' },
               ].map((feat, i) => (
                 <motion.div
                   key={feat.text}
@@ -1261,8 +1264,10 @@ const ConnectTab = () => {
   const [inCall, setInCall] = useState(false);
   const [isInitiator, setIsInitiator] = useState(false);
   const [matchError, setMatchError] = useState('');
+  const [skipNotice, setSkipNotice] = useState('');
   const pollTimeoutRef = useRef(null);
   const isCancelledRef = useRef(false);
+  const modeRef = useRef(null);
 
   const clearPendingPoll = () => {
     if (pollTimeoutRef.current) {
@@ -1305,6 +1310,7 @@ const ConnectTab = () => {
     isCancelledRef.current = false;
     setMatchError('');
     setMode(selectedMode);
+    modeRef.current = selectedMode;
     setMatching(true);
     const networkFingerprint = selectedMode === 'same_wifi'
       ? await deriveSameNetworkFingerprint()
@@ -1329,6 +1335,7 @@ const ConnectTab = () => {
 
         if (data.status === 'matched') {
           clearPendingPoll();
+          setSkipNotice('');
           setMatchedUser(data.matched_user);
           setCallId(data.call_id);
           setIsInitiator(Boolean(data.is_initiator));
@@ -1340,6 +1347,8 @@ const ConnectTab = () => {
         if (Date.now() - startedAt >= MATCH_WAIT_TIMEOUT_MS) {
           setMatching(false);
           setMode(null);
+          modeRef.current = null;
+          setSkipNotice('');
           setMatchError('No one is available right now. Try again in a minute.');
           return;
         }
@@ -1373,6 +1382,8 @@ const ConnectTab = () => {
     } catch (e) { }
     setMatching(false);
     setMode(null);
+    modeRef.current = null;
+    setSkipNotice('');
   };
 
   const endCall = () => {
@@ -1380,7 +1391,31 @@ const ConnectTab = () => {
     setMatchedUser(null);
     setCallId(null);
     setMode(null);
+    modeRef.current = null;
     setIsInitiator(false);
+    setSkipNotice('');
+  };
+
+  // Omegle-style skip: drop the current call and requeue instantly in the
+  // same mode, without bouncing back to mode selection.
+  const skipToNext = (reason) => {
+    const currentMode = modeRef.current;
+    setInCall(false);
+    setMatchedUser(null);
+    setCallId(null);
+    setIsInitiator(false);
+
+    if (!currentMode) {
+      endCall();
+      return;
+    }
+
+    setSkipNotice(
+      reason === 'peer_left'
+        ? 'They moved on. Finding you someone new...'
+        : 'Skipped. Finding your next match...'
+    );
+    void startMatching(currentMode);
   };
 
   if (inCall && matchedUser) {
@@ -1391,6 +1426,7 @@ const ConnectTab = () => {
         mode={mode}
         isInitiator={isInitiator}
         onEndCall={endCall}
+        onSkip={skipToNext}
       />
     );
   }
@@ -1411,7 +1447,12 @@ const ConnectTab = () => {
             </div>
           </div>
 
-          <h2 className="font-heading mb-4 text-2xl font-bold sm:text-3xl">Finding your match...</h2>
+          <h2 className="font-heading mb-4 text-2xl font-bold sm:text-3xl">
+            {skipNotice ? 'Finding your next match...' : 'Finding your match...'}
+          </h2>
+          {skipNotice && (
+            <p className="mb-2 font-bold text-secondary">{skipNotice}</p>
+          )}
           <p className="mb-8 text-sm text-text-secondary sm:text-base">
             Looking for someone in {mode === 'same_college' ? user?.college : mode === 'same_wifi' ? 'your network' : 'other colleges'}
           </p>
@@ -1483,10 +1524,14 @@ const ConnectTab = () => {
 };
 
 // Video Call Component
-const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
+const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall, onSkip }) => {
   const { user } = useAuth();
   const [isMuted, setIsMuted] = useState(false);
   const [isVideoOff, setIsVideoOff] = useState(false);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
+  const [remoteScreenSharing, setRemoteScreenSharing] = useState(false);
+  const [connectionQuality, setConnectionQuality] = useState(null);
+  const [forceRelay, setForceRelay] = useState(false);
   const [chatOpen, setChatOpen] = useState(() => typeof window !== 'undefined' && window.innerWidth >= 1024);
   const [messages, setMessages] = useState([]);
   const [newMessage, setNewMessage] = useState('');
@@ -1517,6 +1562,18 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
   const remoteReadyRef = useRef(false);
   const offerStartedRef = useRef(false);
   const socketRegisteredRef = useRef(false);
+  const screenStreamRef = useRef(null);
+  const videoSenderRef = useRef(null);
+  const statsIntervalRef = useRef(null);
+  const statsPrevRef = useRef({ lost: 0, received: 0 });
+  const iceRestartAttemptedRef = useRef(false);
+  const skipLockRef = useRef(false);
+  const onSkipRef = useRef(onSkip);
+  const canScreenShare = typeof navigator !== 'undefined' && Boolean(navigator.mediaDevices?.getDisplayMedia);
+
+  useEffect(() => {
+    onSkipRef.current = onSkip;
+  }, [onSkip]);
   const reportReasonOptions = [
     { id: 'harassment', label: 'Harassment' },
     { id: 'hate', label: 'Hate speech' },
@@ -1595,7 +1652,14 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
 
   useEffect(() => {
     remoteVideoReadyRef.current = false;
+    iceRestartAttemptedRef.current = false;
+    skipLockRef.current = false;
+    statsPrevRef.current = { lost: 0, received: 0 };
     setProviderOverride(null);
+    setForceRelay(false);
+    setIsScreenSharing(false);
+    setRemoteScreenSharing(false);
+    setConnectionQuality(null);
     if (fallbackTimeoutRef.current) {
       window.clearTimeout(fallbackTimeoutRef.current);
       fallbackTimeoutRef.current = null;
@@ -1643,14 +1707,19 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
     localStreamRef.current = localStream;
     attachVideoElementStream(localVideoRef.current, localStream, { muted: true });
 
+    const remoteScreenTrack =
+      remoteParticipant?.tracks?.screenVideo?.persistentTrack || remoteParticipant?.tracks?.screenVideo?.track || null;
+    const remoteCameraTrack =
+      remoteParticipant?.tracks?.video?.persistentTrack || remoteParticipant?.tracks?.video?.track || null;
+    setRemoteScreenSharing(Boolean(remoteScreenTrack));
     const remoteStream = buildMediaStreamFromTracks([
-      remoteParticipant?.tracks?.video?.persistentTrack || remoteParticipant?.tracks?.video?.track || null,
+      remoteScreenTrack || remoteCameraTrack,
       remoteParticipant?.tracks?.audio?.persistentTrack || remoteParticipant?.tracks?.audio?.track || null,
     ]);
     remoteStreamRef.current = remoteStream;
     attachVideoElementStream(remoteVideoRef.current, remoteStream, { muted: false });
 
-    const hasRemoteVideo = Boolean(remoteParticipant?.tracks?.video?.persistentTrack || remoteParticipant?.tracks?.video?.track);
+    const hasRemoteVideo = Boolean(remoteScreenTrack || remoteCameraTrack);
     setRemoteVideoReady(hasRemoteVideo);
     if (hasRemoteVideo) {
       setCallStatus('Connected');
@@ -1680,6 +1749,8 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         remoteReadyRef.current = false;
         offerStartedRef.current = false;
         socketRegisteredRef.current = false;
+        iceRestartAttemptedRef.current = false;
+        statsPrevRef.current = { lost: 0, received: 0 };
         callProviderRef.current = 'webrtc';
         setCallStatus('Connecting to live call...');
         setRemoteVideoReady(false);
@@ -1800,11 +1871,25 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           debugLog('socket:error', data || {});
           setCallError(data?.detail || 'A realtime error interrupted the call.');
         });
+        socketRef.current.on('screen_share', (data) => {
+          if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
+            return;
+          }
+          debugLog('socket:screen-share', data || {});
+          if (callProviderRef.current !== 'daily') {
+            setRemoteScreenSharing(Boolean(data?.active));
+          }
+        });
         socketRef.current.on('call_ended', (data) => {
           if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
             return;
           }
           debugLog('socket:call-ended', data || {});
+          if (onSkipRef.current && !skipLockRef.current) {
+            skipLockRef.current = true;
+            onSkipRef.current('peer_left');
+            return;
+          }
           handleEndCall(false);
         });
 
@@ -1937,10 +2022,31 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           });
         }
 
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: true
-        });
+        let stream;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 1280 },
+              height: { ideal: 720 },
+              frameRate: { ideal: 30, max: 30 },
+              facingMode: 'user',
+            },
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+        } catch (constraintError) {
+          debugLog('media:hd-constraints-fallback', {
+            name: constraintError?.name,
+            message: constraintError?.message,
+          });
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true
+          });
+        }
         debugLog('media:get-user-media-success', {
           audioTracks: stream.getAudioTracks().map(summarizeTrack),
           videoTracks: stream.getVideoTracks().map(summarizeTrack),
@@ -1953,15 +2059,23 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         localStreamRef.current = stream;
         attachVideoElementStream(localVideoRef.current, stream, { muted: true });
 
+        // STUN-first for the lowest latency path; escalate to TURN-only when
+        // direct/reflexive routes are blocked by strict campus NATs/firewalls.
+        const useRelayOnly = forceRelay && Boolean(rtcConfig.turn_enabled);
         peerConnectionRef.current = new RTCPeerConnection({
           iceServers: rtcConfig.ice_servers,
-          iceTransportPolicy: 'all',
+          iceTransportPolicy: useRelayOnly ? 'relay' : 'all',
+          bundlePolicy: 'max-bundle',
+          rtcpMuxPolicy: 'require',
           iceCandidatePoolSize: 10,
         });
         debugLog('webrtc:peer-created', {
-          iceTransportPolicy: 'all',
+          iceTransportPolicy: useRelayOnly ? 'relay' : 'all',
           iceCandidatePoolSize: 10,
         });
+        if (useRelayOnly) {
+          setCallStatus('Connecting through relay servers...');
+        }
 
         const attachRemoteStream = (incomingStream) => {
           if (!incomingStream) {
@@ -2012,11 +2126,30 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         };
 
         stream.getTracks().forEach(track => {
-          peerConnectionRef.current.addTrack(track, stream);
+          const sender = peerConnectionRef.current.addTrack(track, stream);
+          if (track.kind === 'video') {
+            videoSenderRef.current = sender;
+          }
         });
         debugLog('webrtc:tracks-added', {
           tracks: stream.getTracks().map(summarizeTrack),
         });
+
+        try {
+          const videoSender = videoSenderRef.current;
+          if (videoSender) {
+            const senderParams = videoSender.getParameters();
+            senderParams.degradationPreference = 'balanced';
+            if (!senderParams.encodings || senderParams.encodings.length === 0) {
+              senderParams.encodings = [{}];
+            }
+            senderParams.encodings[0].maxBitrate = 1_500_000;
+            await videoSender.setParameters(senderParams);
+            debugLog('webrtc:sender-tuned', { maxBitrate: 1_500_000 });
+          }
+        } catch (senderError) {
+          debugLog('webrtc:sender-tune-error', { message: senderError?.message });
+        }
         if (canFallbackToDaily) {
           fallbackTimeoutRef.current = window.setTimeout(() => {
             if (!remoteVideoReadyRef.current && callProviderRef.current === 'webrtc') {
@@ -2063,18 +2196,73 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           }
         };
 
+        // Recovery ladder: 1) ICE restart over the same connection,
+        // 2) rebuild TURN-only when the direct path is firewalled,
+        // 3) Daily managed relay as the final fallback.
+        const escalateConnectionRecovery = async (trigger) => {
+          if (!isMounted || !peerConnectionRef.current) {
+            return;
+          }
+
+          if (isInitiator && !iceRestartAttemptedRef.current) {
+            iceRestartAttemptedRef.current = true;
+            debugLog('webrtc:ice-restart', { trigger });
+            setCallStatus('Reconnecting...');
+            try {
+              const restartOffer = await peerConnectionRef.current.createOffer({ iceRestart: true });
+              await peerConnectionRef.current.setLocalDescription(restartOffer);
+              socketRef.current?.emit('offer', {
+                offer: restartOffer,
+                target_id: matchedUser.user_id,
+                call_id: callId,
+              });
+              return;
+            } catch (restartError) {
+              debugLog('webrtc:ice-restart-error', { message: restartError?.message });
+            }
+          }
+
+          if (rtcConfig.turn_enabled && !forceRelay) {
+            debugLog('webrtc:relay-escalation', { trigger });
+            setCallStatus('Switching to relay servers...');
+            setForceRelay(true);
+            return;
+          }
+
+          if (!triggerDailyFallback('connection_failed_after_recovery', { trigger })) {
+            setCallStatus('Connection failed.');
+            setCallError('Could not build a stable route to this peer. Skip to the next match or try again.');
+          }
+        };
+
+        const scheduleRecovery = (trigger) => {
+          if (isInitiator) {
+            void escalateConnectionRecovery(trigger);
+            return;
+          }
+          // Give the initiator a moment to drive an ICE restart before the
+          // answerer tears the connection down for a relay rebuild.
+          window.setTimeout(() => {
+            const currentIceState = peerConnectionRef.current?.iceConnectionState;
+            const currentState = peerConnectionRef.current?.connectionState;
+            if (currentIceState === 'failed' || currentState === 'failed') {
+              void escalateConnectionRecovery(`${trigger}_waited`);
+            }
+          }, 5000);
+        };
+
         peerConnectionRef.current.onconnectionstatechange = () => {
           const state = peerConnectionRef.current?.connectionState;
           debugLog('webrtc:connection-state', { state });
-          if (state === 'failed' && triggerDailyFallback('connection_state_failed', { state })) {
+          if (state === 'failed') {
+            setCallStatus('Connection failed. Trying to recover...');
+            scheduleRecovery('connection_state_failed');
             return;
           }
           if (state === 'connected') {
             setCallStatus('Connected');
           } else if (state === 'connecting') {
             setCallStatus('Connecting video...');
-          } else if (state === 'failed') {
-            setCallStatus('Connection failed. Trying to recover...');
           } else if (state === 'disconnected') {
             setCallStatus('Connection interrupted...');
           }
@@ -2083,7 +2271,9 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         peerConnectionRef.current.oniceconnectionstatechange = () => {
           const iceState = peerConnectionRef.current?.iceConnectionState;
           debugLog('webrtc:ice-connection-state', { iceState });
-          if (iceState === 'failed' && triggerDailyFallback('ice_connection_failed', { iceState })) {
+          if (iceState === 'failed') {
+            setCallStatus('Network route failed. Recovering...');
+            scheduleRecovery('ice_connection_failed');
             return;
           }
           if (iceState === 'checking') {
@@ -2092,6 +2282,54 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             setCallStatus('Connected');
           }
         };
+
+        // Lightweight live quality probe for the in-call badge.
+        statsIntervalRef.current = window.setInterval(async () => {
+          const pc = peerConnectionRef.current;
+          if (!pc || (pc.connectionState !== 'connected' && pc.iceConnectionState !== 'connected' && pc.iceConnectionState !== 'completed')) {
+            return;
+          }
+          try {
+            const stats = await pc.getStats();
+            let rtt = null;
+            let packetsLost = 0;
+            let packetsReceived = 0;
+            let usingRelay = false;
+            stats.forEach((report) => {
+              if (report.type === 'candidate-pair' && report.state === 'succeeded' && report.nominated) {
+                if (typeof report.currentRoundTripTime === 'number') {
+                  rtt = report.currentRoundTripTime;
+                }
+                const localCandidate = stats.get(report.localCandidateId);
+                if (localCandidate?.candidateType === 'relay') {
+                  usingRelay = true;
+                }
+              }
+              if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                packetsLost = report.packetsLost || 0;
+                packetsReceived = report.packetsReceived || 0;
+              }
+            });
+
+            const previous = statsPrevRef.current;
+            const lostDelta = Math.max(0, packetsLost - previous.lost);
+            const receivedDelta = Math.max(0, packetsReceived - previous.received);
+            statsPrevRef.current = { lost: packetsLost, received: packetsReceived };
+            const lossRatio = lostDelta + receivedDelta > 0 ? lostDelta / (lostDelta + receivedDelta) : 0;
+
+            let level = 'good';
+            if ((rtt !== null && rtt > 0.4) || lossRatio > 0.08) {
+              level = 'poor';
+            } else if ((rtt !== null && rtt > 0.2) || lossRatio > 0.03) {
+              level = 'fair';
+            }
+            if (isMounted) {
+              setConnectionQuality({ level, relay: usingRelay });
+            }
+          } catch (statsError) {
+            console.debug('Stats probe error:', statsError);
+          }
+        }, 3000);
 
         peerConnectionRef.current.onicecandidate = (event) => {
           if (event.candidate) {
@@ -2189,6 +2427,13 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
           call_id: callId,
         });
 
+        if (useRelayOnly && isInitiator) {
+          // Mid-call relay rebuild: the peer is already live, so re-offer
+          // immediately instead of waiting for a fresh call_ready handshake.
+          remoteReadyRef.current = true;
+          await sendOfferIfReady();
+        }
+
       } catch (err) {
         debugLog('setup:error', {
           name: err?.name,
@@ -2212,6 +2457,15 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         window.clearTimeout(fallbackTimeoutRef.current);
         fallbackTimeoutRef.current = null;
       }
+      if (statsIntervalRef.current) {
+        window.clearInterval(statsIntervalRef.current);
+        statsIntervalRef.current = null;
+      }
+      if (screenStreamRef.current) {
+        screenStreamRef.current.getTracks().forEach(track => track.stop());
+        screenStreamRef.current = null;
+      }
+      videoSenderRef.current = null;
       pendingIceCandidatesRef.current = [];
       if (callProviderRef.current === 'daily' && dailyCallRef.current) {
         try {
@@ -2246,7 +2500,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
         socketRef.current = null;
       }
     };
-  }, [user, matchedUser, callId, isInitiator, mode, providerOverride, handleEndCall, syncDailyParticipantMedia, attachVideoElementStream, debugLog]);
+  }, [user, matchedUser, callId, isInitiator, mode, providerOverride, forceRelay, handleEndCall, syncDailyParticipantMedia, attachVideoElementStream, debugLog]);
 
   const toggleMute = () => {
     const nextMuted = !isMuted;
@@ -2282,6 +2536,100 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
       });
       setIsVideoOff(nextVideoOff);
     }
+  };
+
+  const emitScreenShareState = (active) => {
+    socketRef.current?.emit('screen_share', {
+      target_id: matchedUser.user_id,
+      call_id: callId,
+      active,
+    });
+  };
+
+  const stopScreenShare = async () => {
+    const screenStream = screenStreamRef.current;
+    screenStreamRef.current = null;
+    screenStream?.getTracks().forEach(track => track.stop());
+
+    if (callProviderRef.current === 'daily') {
+      try {
+        dailyCallRef.current?.stopScreenShare();
+      } catch (error) {
+        console.debug('Daily stop screen share error:', error);
+      }
+    } else {
+      const cameraTrack = localStreamRef.current?.getVideoTracks()[0] || null;
+      try {
+        await videoSenderRef.current?.replaceTrack(cameraTrack);
+      } catch (error) {
+        console.debug('Screen share track restore error:', error);
+      }
+      attachVideoElementStream(localVideoRef.current, localStreamRef.current, { muted: true });
+    }
+
+    emitScreenShareState(false);
+    setIsScreenSharing(false);
+  };
+
+  const toggleScreenShare = async () => {
+    if (!canScreenShare) {
+      return;
+    }
+    if (isScreenSharing) {
+      await stopScreenShare();
+      return;
+    }
+
+    try {
+      if (callProviderRef.current === 'daily') {
+        await dailyCallRef.current?.startScreenShare();
+        setIsScreenSharing(true);
+        emitScreenShareState(true);
+        return;
+      }
+
+      const displayStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: { ideal: 30, max: 30 } },
+        audio: false,
+      });
+      const screenTrack = displayStream.getVideoTracks()[0];
+      if (!screenTrack) {
+        return;
+      }
+      try {
+        screenTrack.contentHint = 'detail';
+      } catch (hintError) {
+        console.debug('Screen track content hint error:', hintError);
+      }
+      screenStreamRef.current = displayStream;
+      // replaceTrack swaps the outgoing frames without renegotiation, so the
+      // peer sees the screen instantly on the same connection.
+      await videoSenderRef.current?.replaceTrack(screenTrack);
+      attachVideoElementStream(localVideoRef.current, displayStream, { muted: true });
+      screenTrack.onended = () => {
+        void stopScreenShare();
+      };
+      setIsScreenSharing(true);
+      emitScreenShareState(true);
+    } catch (error) {
+      if (error?.name !== 'NotAllowedError') {
+        setCallError(getErrorMessage(error, 'Could not start screen sharing.'));
+      }
+    }
+  };
+
+  const handleSkip = () => {
+    if (!onSkip || skipLockRef.current) {
+      return;
+    }
+    skipLockRef.current = true;
+    if (socketRef.current) {
+      socketRef.current.emit('end_call', {
+        target_id: matchedUser.user_id,
+        call_id: callId,
+      });
+    }
+    onSkip('skipped');
   };
 
   const sendMessage = () => {
@@ -2376,7 +2724,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
     friend: 'Friend Call'
   };
   const remoteInitial = matchedUser.name?.trim()?.charAt(0)?.toUpperCase() || '?';
-  const callControlButtonClass = 'btn-brutal flex min-h-[56px] w-full items-center justify-center px-3 py-3 sm:min-h-[60px]';
+  const callControlButtonClass = 'btn-brutal flex min-h-[56px] w-full items-center justify-center px-3 py-3 sm:min-h-[60px] sm:w-auto sm:min-w-[64px]';
 
   return (
     <motion.div
@@ -2403,7 +2751,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             autoPlay
             playsInline
             onLoadedMetadata={() => ensureVideoPlayback(remoteVideoRef.current)}
-            className="w-full h-full object-cover"
+            className={`h-full w-full ${remoteScreenSharing ? 'bg-black object-contain' : 'object-cover'}`}
           />
           <div className="absolute inset-0 bg-gradient-to-b from-black/35 via-transparent to-black/70 pointer-events-none" />
           <div className="absolute left-3 right-3 top-3 z-10 flex flex-col gap-3 sm:left-4 sm:right-4 sm:top-4 sm:flex-row sm:items-start sm:justify-between">
@@ -2416,11 +2764,35 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
                 <p className="truncate text-sm text-text-secondary">{matchedUser.college}</p>
               </div>
             </div>
-            <div className="self-start rounded-[24px] border border-white/20 bg-black/60 px-4 py-3 text-white backdrop-blur-xl">
-              <div className="flex items-center gap-2 text-sm font-bold">
-                <Radio className="w-4 h-4" strokeWidth={2.5} />
-                {callStatus}
+            <div className="flex flex-row flex-wrap items-center gap-2 self-start sm:flex-col sm:items-end">
+              <div className="rounded-[24px] border border-white/20 bg-black/60 px-4 py-3 text-white backdrop-blur-xl">
+                <div className="flex items-center gap-2 text-sm font-bold">
+                  <Radio className="w-4 h-4" strokeWidth={2.5} />
+                  {callStatus}
+                </div>
               </div>
+              {connectionQuality && (
+                <div className="flex items-center gap-2 rounded-full border border-white/20 bg-black/60 px-3 py-1.5 text-xs font-bold text-white backdrop-blur-xl">
+                  <Activity className="h-3.5 w-3.5" strokeWidth={2.5} />
+                  <span
+                    className={`h-2 w-2 rounded-full ${
+                      connectionQuality.level === 'good'
+                        ? 'bg-green-400'
+                        : connectionQuality.level === 'fair'
+                          ? 'bg-yellow-400'
+                          : 'bg-red-400'
+                    }`}
+                  />
+                  {connectionQuality.level === 'good' ? 'Strong' : connectionQuality.level === 'fair' ? 'Okay' : 'Weak'}
+                  {connectionQuality.relay && <span className="text-white/70">· Relay</span>}
+                </div>
+              )}
+              {remoteScreenSharing && (
+                <div className="flex items-center gap-2 rounded-full border border-white/20 bg-secondary/85 px-3 py-1.5 text-xs font-bold text-white backdrop-blur-xl">
+                  <ScreenShare className="h-3.5 w-3.5" strokeWidth={2.5} />
+                  Sharing screen
+                </div>
+              )}
             </div>
           </div>
 
@@ -2448,7 +2820,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
                 className="h-full w-full object-cover"
               />
               <div className="absolute inset-x-0 bottom-0 bg-black/55 px-3 py-2 text-sm font-bold text-white backdrop-blur-md">
-                You
+                {isScreenSharing ? 'Your screen' : 'You'}
               </div>
             </div>
           </div>
@@ -2478,7 +2850,7 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             )}
           </div>
 
-          <div className="grid grid-cols-4 gap-3 rounded-none border-2 border-border bg-surface/84 px-3 py-3 shadow-brutal backdrop-blur-xl sm:grid-cols-7 sm:px-4 sm:py-4 xl:flex xl:flex-wrap xl:items-center xl:justify-center">
+          <div className="grid grid-cols-4 gap-2 rounded-none border-2 border-border bg-surface/84 px-3 py-3 shadow-brutal backdrop-blur-xl sm:flex sm:flex-wrap sm:items-center sm:justify-center sm:gap-3 sm:px-4 sm:py-4">
             <button
               data-testid="toggle-mute-btn"
               onClick={toggleMute}
@@ -2498,6 +2870,18 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             >
               {isVideoOff ? <VideoOff strokeWidth={2.5} /> : <Video strokeWidth={2.5} />}
             </button>
+
+            {canScreenShare && (
+              <button
+                data-testid="toggle-screenshare-btn"
+                onClick={toggleScreenShare}
+                className={`${callControlButtonClass} ${isScreenSharing ? 'bg-secondary text-white' : 'bg-surface'}`}
+                aria-label={isScreenSharing ? 'Stop sharing screen' : 'Share screen'}
+                title={isScreenSharing ? 'Stop sharing screen' : 'Share screen'}
+              >
+                {isScreenSharing ? <ScreenShareOff strokeWidth={2.5} /> : <ScreenShare strokeWidth={2.5} />}
+              </button>
+            )}
 
             <button
               data-testid="chat-btn"
@@ -2545,6 +2929,21 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall }) => {
             >
               <Ban strokeWidth={2.5} />
             </button>
+
+            {onSkip && (
+              <button
+                data-testid="skip-next-btn"
+                onClick={handleSkip}
+                className={`${callControlButtonClass} bg-secondary text-white`}
+                aria-label="Skip to the next match"
+                title="Skip to the next match"
+              >
+                <span className="flex items-center gap-2">
+                  <SkipForward strokeWidth={2.5} />
+                  <span className="hidden lg:inline">Next</span>
+                </span>
+              </button>
+            )}
 
             <button
               data-testid="end-call-btn"
