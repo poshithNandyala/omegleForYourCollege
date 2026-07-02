@@ -17,6 +17,29 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+/* Layered ambient gradient behind every screen (overrides the flat token) */
+.bg-background {
+  background-color: #FDF7EC;
+  background-image:
+    radial-gradient(1100px 600px at 88% -12%, rgba(255, 73, 219, 0.12), transparent 60%),
+    radial-gradient(950px 550px at -12% 28%, rgba(37, 99, 235, 0.09), transparent 55%),
+    radial-gradient(850px 500px at 55% 112%, rgba(140, 227, 176, 0.22), transparent 60%);
+  background-attachment: fixed;
+}
+
+/* Premium accent text */
+.text-gradient {
+  background: linear-gradient(120deg, #FF49DB 0%, #7C3AED 52%, #2563EB 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+:focus-visible {
+  outline: 3px solid #2563EB;
+  outline-offset: 2px;
+}
+
 h1, h2, h3, h4, h5, h6 {
   font-family: 'Bricolage Grotesque', sans-serif;
 }
@@ -30,11 +53,13 @@ select {
 
 /* Neo-Brutalist Button Base */
 .btn-brutal {
-  @apply inline-flex items-center justify-center gap-2 border-2 border-border rounded-none px-5 py-3 text-sm font-bold leading-tight transition-all duration-200 sm:text-base;
+  @apply inline-flex items-center justify-center gap-2 border-2 border-border px-5 py-3 text-sm font-bold leading-tight sm:text-base;
+  border-radius: 10px;
   box-shadow: 4px 4px 0px #121212;
   min-height: 3.25rem;
   -webkit-tap-highlight-color: transparent;
   touch-action: manipulation;
+  transition: transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.18s ease, background-color 0.18s ease;
 }
 
 .btn-brutal:hover {
@@ -43,12 +68,13 @@ select {
 }
 
 .btn-brutal:active {
-  transform: translate(0, 0);
+  transform: translate(1px, 1px) scale(0.98);
   box-shadow: 2px 2px 0px #121212;
 }
 
 .btn-primary {
-  @apply btn-brutal bg-primary text-text-primary;
+  @apply btn-brutal text-text-primary;
+  background-image: linear-gradient(135deg, #FF49DB 0%, #FF7AE5 100%);
 }
 
 .btn-secondary {
@@ -69,13 +95,15 @@ select {
 
 /* Card Base */
 .card-brutal {
-  @apply bg-surface border-2 border-border p-4 rounded-none sm:p-6;
+  @apply bg-surface border-2 border-border p-4 sm:p-6;
+  border-radius: 14px;
   box-shadow: 4px 4px 0px #121212;
 }
 
 /* Input Base */
 .input-brutal {
-  @apply w-full border-2 border-border rounded-none bg-surface px-4 py-3 text-base outline-none transition-all sm:py-4 sm:text-lg;
+  @apply w-full border-2 border-border bg-surface px-4 py-3 text-base outline-none transition-all sm:py-4 sm:text-lg;
+  border-radius: 10px;
   min-height: 3.25rem;
 }
 
@@ -152,4 +180,20 @@ select {
   .card-brutal {
     box-shadow: 3px 3px 0px #121212;
   }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Video elements never flash white while streams attach */
+video {
+  background-color: #121212;
 }
