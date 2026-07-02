@@ -5,10 +5,16 @@ import os
 import uuid
 import secrets
 import asyncio
+import hashlib
+import hmac
 import logging
 import ipaddress
 import json
 import re
+import ssl
+import struct
+import time
+from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any, Literal
 from contextlib import asynccontextmanager
@@ -180,6 +186,7 @@ RATE_LIMITS = {
     "socket_ice": (600, 60),
     "socket_chat": (60, 60),
     "socket_screen_share": (30, 60),
+    "turn_check": (6, 300),
 }
 
 PROFILE_CONTACT_PATTERNS = [
@@ -1187,6 +1194,240 @@ def build_ice_servers() -> List[Dict[str, Any]]:
             }
         )
     return ice_servers
+
+# ---- STUN/TURN health probes (minimal RFC 5389 / RFC 5766 client) ----
+# Used by /api/turn-check to prove, from this server's network, that the
+# configured STUN servers answer and the TURN credentials produce a real
+# relay allocation.
+
+STUN_MAGIC_COOKIE = 0x2112A442
+STUN_BINDING_REQUEST = 0x0001
+STUN_BINDING_SUCCESS = 0x0101
+TURN_ALLOCATE_REQUEST = 0x0003
+TURN_ALLOCATE_SUCCESS = 0x0103
+STUN_ATTR_USERNAME = 0x0006
+STUN_ATTR_MESSAGE_INTEGRITY = 0x0008
+STUN_ATTR_ERROR_CODE = 0x0009
+STUN_ATTR_REALM = 0x0014
+STUN_ATTR_NONCE = 0x0015
+STUN_ATTR_REQUESTED_TRANSPORT = 0x0019
+
+
+def _stun_attr(attr_type: int, value: bytes) -> bytes:
+    padding = (4 - len(value) % 4) % 4
+    return struct.pack("!HH", attr_type, len(value)) + value + b"\x00" * padding
+
+
+def _stun_message(
+    message_type: int,
+    transaction_id: bytes,
+    attributes: bytes,
+    integrity_key: Optional[bytes] = None,
+) -> bytes:
+    if integrity_key is not None:
+        # The HMAC input uses a length that already counts the 24-byte
+        # MESSAGE-INTEGRITY attribute about to be appended.
+        hmac_header = struct.pack("!HHI", message_type, len(attributes) + 24, STUN_MAGIC_COOKIE) + transaction_id
+        digest = hmac.new(integrity_key, hmac_header + attributes, hashlib.sha1).digest()
+        attributes = attributes + _stun_attr(STUN_ATTR_MESSAGE_INTEGRITY, digest)
+    header = struct.pack("!HHI", message_type, len(attributes), STUN_MAGIC_COOKIE) + transaction_id
+    return header + attributes
+
+
+def _parse_stun_attributes(payload: bytes) -> Dict[int, bytes]:
+    attributes: Dict[int, bytes] = {}
+    offset = 0
+    while offset + 4 <= len(payload):
+        attr_type, attr_length = struct.unpack_from("!HH", payload, offset)
+        offset += 4
+        attributes.setdefault(attr_type, payload[offset:offset + attr_length])
+        offset += attr_length + ((4 - attr_length % 4) % 4)
+    return attributes
+
+
+def _stun_error_detail(attributes: Dict[int, bytes]) -> str:
+    raw_error = attributes.get(STUN_ATTR_ERROR_CODE)
+    if not raw_error or len(raw_error) < 4:
+        return "unknown error"
+    code = raw_error[2] * 100 + raw_error[3]
+    reason = raw_error[4:].decode("utf-8", "replace").strip()
+    return f"{code} {reason}".strip()
+
+
+def _parse_ice_server_url(url: str) -> Dict[str, Any]:
+    parsed = urlparse(url)
+    scheme = parsed.scheme.lower()
+    host_port = parsed.path or parsed.netloc
+    transport = "udp"
+    if "transport=tcp" in (parsed.query or "").lower():
+        transport = "tcp"
+    if scheme == "turns":
+        transport = "tls"
+
+    host, separator, port_text = host_port.rpartition(":")
+    if separator and port_text.isdigit():
+        port = int(port_text)
+    else:
+        host = host_port
+        port = 5349 if scheme == "turns" else 3478
+
+    return {"scheme": scheme, "host": host, "port": port, "transport": transport}
+
+
+class _StunUdpProtocol(asyncio.DatagramProtocol):
+    def __init__(self) -> None:
+        self.responses: asyncio.Queue = asyncio.Queue()
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        self.responses.put_nowait(data)
+
+
+async def _stun_exchange(
+    host: str,
+    port: int,
+    transport: str,
+    requests: List[bytes],
+    timeout: float = 5.0,
+) -> List[bytes]:
+    """Send STUN requests sequentially over one connection, returning responses."""
+    responses: List[bytes] = []
+
+    if transport == "udp":
+        loop = asyncio.get_running_loop()
+        udp_transport, protocol = await loop.create_datagram_endpoint(
+            _StunUdpProtocol, remote_addr=(host, port)
+        )
+        try:
+            for request in requests:
+                udp_transport.sendto(request)
+                responses.append(await asyncio.wait_for(protocol.responses.get(), timeout))
+        finally:
+            udp_transport.close()
+        return responses
+
+    ssl_context = ssl.create_default_context() if transport == "tls" else None
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(host, port, ssl=ssl_context), timeout
+    )
+    try:
+        for request in requests:
+            writer.write(request)
+            await writer.drain()
+            header = await asyncio.wait_for(reader.readexactly(20), timeout)
+            (magic_cookie,) = struct.unpack_from("!I", header, 4)
+            (body_length,) = struct.unpack_from("!H", header, 2)
+            if magic_cookie != STUN_MAGIC_COOKIE or body_length > 4096:
+                raise ValueError("endpoint did not answer with STUN (wrong port or intercepted)")
+            body = await asyncio.wait_for(reader.readexactly(body_length), timeout)
+            responses.append(header + body)
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+    return responses
+
+
+async def check_stun_url(url: str) -> Dict[str, Any]:
+    target = _parse_ice_server_url(url)
+    started = time.monotonic()
+    try:
+        request = _stun_message(STUN_BINDING_REQUEST, os.urandom(12), b"")
+        responses = await _stun_exchange(target["host"], target["port"], "udp", [request])
+        message_type = struct.unpack_from("!H", responses[0], 0)[0]
+        ok = message_type == STUN_BINDING_SUCCESS
+        return {
+            "url": url,
+            "kind": "stun",
+            "ok": ok,
+            "rtt_ms": round((time.monotonic() - started) * 1000),
+            "detail": "binding response received" if ok else f"unexpected response 0x{message_type:04x}",
+        }
+    except Exception as exc:
+        return {
+            "url": url,
+            "kind": "stun",
+            "ok": False,
+            "rtt_ms": None,
+            "detail": f"{type(exc).__name__}: {exc}" or "unreachable",
+        }
+
+
+async def check_turn_url(url: str, username: str, credential: str) -> Dict[str, Any]:
+    target = _parse_ice_server_url(url)
+    started = time.monotonic()
+    requested_transport = _stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3x", 17))
+    try:
+        first_request = _stun_message(TURN_ALLOCATE_REQUEST, os.urandom(12), requested_transport)
+        first_response = (
+            await _stun_exchange(target["host"], target["port"], target["transport"], [first_request])
+        )[0]
+        first_type = struct.unpack_from("!H", first_response, 0)[0]
+        first_attributes = _parse_stun_attributes(first_response[20:])
+
+        if first_type == TURN_ALLOCATE_SUCCESS:
+            return {
+                "url": url,
+                "kind": "turn",
+                "ok": True,
+                "rtt_ms": round((time.monotonic() - started) * 1000),
+                "detail": "relay allocation granted without auth challenge",
+            }
+
+        realm = first_attributes.get(STUN_ATTR_REALM)
+        nonce = first_attributes.get(STUN_ATTR_NONCE)
+        if realm is None or nonce is None:
+            return {
+                "url": url,
+                "kind": "turn",
+                "ok": False,
+                "rtt_ms": round((time.monotonic() - started) * 1000),
+                "detail": f"no auth challenge: {_stun_error_detail(first_attributes)}",
+            }
+
+        integrity_key = hashlib.md5(
+            b":".join([username.encode(), realm, credential.encode()])
+        ).digest()
+        authed_attributes = (
+            requested_transport
+            + _stun_attr(STUN_ATTR_USERNAME, username.encode())
+            + _stun_attr(STUN_ATTR_REALM, realm)
+            + _stun_attr(STUN_ATTR_NONCE, nonce)
+        )
+        second_request = _stun_message(
+            TURN_ALLOCATE_REQUEST, os.urandom(12), authed_attributes, integrity_key=integrity_key
+        )
+        second_response = (
+            await _stun_exchange(target["host"], target["port"], target["transport"], [second_request])
+        )[0]
+        second_type = struct.unpack_from("!H", second_response, 0)[0]
+        second_attributes = _parse_stun_attributes(second_response[20:])
+
+        if second_type == TURN_ALLOCATE_SUCCESS:
+            return {
+                "url": url,
+                "kind": "turn",
+                "ok": True,
+                "rtt_ms": round((time.monotonic() - started) * 1000),
+                "detail": "relay allocation granted (credentials valid)",
+            }
+        return {
+            "url": url,
+            "kind": "turn",
+            "ok": False,
+            "rtt_ms": round((time.monotonic() - started) * 1000),
+            "detail": f"allocation rejected: {_stun_error_detail(second_attributes)}",
+        }
+    except Exception as exc:
+        return {
+            "url": url,
+            "kind": "turn",
+            "ok": False,
+            "rtt_ms": None,
+            "detail": f"{type(exc).__name__}: {exc}" or "unreachable",
+        }
+
 
 # Password functions
 def hash_password(password: str) -> str:
@@ -2757,6 +2998,37 @@ async def chat_message(sid, data):
     }, room=user_room(target_id))
 
 # ============ HEALTH & STATS ============ 
+
+@app.get("/api/turn-check")
+async def turn_check(request: Request):
+    """Live-verify STUN reachability and TURN credentials from this server.
+
+    Performs a real TURN Allocate handshake against every configured TURN URL,
+    so a passing result is cryptographic proof the relay accepts our
+    credentials. Safe to expose: it returns only booleans, latencies, and
+    error strings.
+    """
+    await enforce_rate_limit(
+        f"turn-check:{get_request_ip(request)}",
+        limit_name="turn_check",
+        override_message="Too many connectivity checks. Try again in a few minutes.",
+    )
+
+    checks = [check_stun_url(url) for url in STUN_URLS[:2]]
+    if TURN_ENABLED:
+        checks.extend(check_turn_url(url, TURN_USERNAME, TURN_CREDENTIAL) for url in TURN_URLS)
+    results = await asyncio.gather(*checks)
+
+    turn_results = [result for result in results if result["kind"] == "turn"]
+    stun_results = [result for result in results if result["kind"] == "stun"]
+    return {
+        "turn_enabled": TURN_ENABLED,
+        "turn_working": any(result["ok"] for result in turn_results) if turn_results else False,
+        "stun_working": any(result["ok"] for result in stun_results) if stun_results else False,
+        "results": results,
+        "checked_at": utcnow().isoformat(),
+    }
+
 
 @app.get("/api/rtc-config")
 async def get_rtc_config():

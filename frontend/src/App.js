@@ -56,6 +56,56 @@ const getRtcConfig = async () => {
 const getErrorMessage = (error, fallback) =>
   error?.response?.data?.detail || error?.message || fallback;
 
+// Gather ICE candidates with the given policy and report which candidate
+// types appeared ('host', 'srflx', 'relay'...). Used by the network test.
+const gatherIceCandidateTypes = (iceServers, policy, timeoutMs = 9000) =>
+  new Promise((resolve) => {
+    const foundTypes = new Set();
+    let peerConnection;
+    try {
+      peerConnection = new RTCPeerConnection({ iceServers, iceTransportPolicy: policy });
+    } catch (error) {
+      console.debug('Network test peer error:', error);
+      resolve(foundTypes);
+      return;
+    }
+
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timerId);
+      try {
+        peerConnection.close();
+      } catch (error) {
+        console.debug('Network test close error:', error);
+      }
+      resolve(foundTypes);
+    };
+    const timerId = setTimeout(finish, timeoutMs);
+
+    peerConnection.onicecandidate = (event) => {
+      if (!event.candidate) {
+        finish();
+        return;
+      }
+      const match = event.candidate.candidate.match(/\btyp\s+([a-z]+)/i);
+      if (match) {
+        foundTypes.add(match[1]);
+      }
+      // Stop early once we have proof of the path we're probing for.
+      if (policy === 'relay' && foundTypes.has('relay')) {
+        finish();
+      }
+    };
+
+    peerConnection.createDataChannel('campuslink-network-test');
+    peerConnection
+      .createOffer()
+      .then((offer) => peerConnection.setLocalDescription(offer))
+      .catch(finish);
+  });
+
 const summarizeTrack = (track) => {
   if (!track) {
     return null;
@@ -355,10 +405,24 @@ const ProtectedRoute = ({ children }) => {
 const LandingPage = () => {
   const navigate = useNavigate();
   const { user } = useAuth();
+  const [liveStats, setLiveStats] = useState(null);
 
   useEffect(() => {
     if (user) navigate('/dashboard');
   }, [user, navigate]);
+
+  useEffect(() => {
+    let cancelled = false;
+    axios
+      .get('/api/stats')
+      .then(({ data }) => {
+        if (!cancelled) setLiveStats(data);
+      })
+      .catch(() => { });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   return (
     <div className="min-h-screen bg-background">
@@ -390,17 +454,24 @@ const LandingPage = () => {
             animate={{ opacity: 1, y: 0 }}
             transition={{ duration: 0.5 }}
           >
+            {liveStats && liveStats.online_users > 0 && (
+              <span className="mb-5 inline-flex items-center gap-2 rounded-full border-2 border-border bg-surface px-4 py-2 text-sm font-bold shadow-brutal">
+                <span className="h-2 w-2 animate-pulse rounded-full bg-green-500" />
+                {liveStats.online_users} student{liveStats.online_users === 1 ? '' : 's'} online right now
+              </span>
+            )}
             <h2 className="mb-6 font-heading text-4xl font-black tracking-tighter sm:text-5xl lg:text-6xl">
               Connect with
-              <span className="text-primary"> College </span>
+              <span className="text-gradient"> College </span>
               Students
             </h2>
             <p className="mb-8 text-base leading-relaxed text-text-secondary sm:text-lg">
               Find study buddies, networking partners, co-founders, or maybe even love.
-              Connect with students from your college or across India.
+              Random video chat, screen sharing, and instant skips — with students from
+              your college or across India.
             </p>
 
-            <div className="mb-10 flex flex-wrap gap-4 sm:mb-12">
+            <div className="mb-6 flex flex-wrap gap-4 sm:mb-8">
               <button
                 data-testid="get-started-btn"
                 onClick={() => navigate('/signup')}
@@ -409,6 +480,18 @@ const LandingPage = () => {
                 Get Started Free
                 <ChevronRight className="inline ml-2" strokeWidth={2.5} />
               </button>
+            </div>
+
+            <div className="mb-10 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm font-bold text-text-secondary sm:mb-12">
+              <span className="flex items-center gap-1.5">
+                <Check className="h-4 w-4 text-green-600" strokeWidth={3} /> College-email verified
+              </span>
+              <span className="flex items-center gap-1.5">
+                <Check className="h-4 w-4 text-green-600" strokeWidth={3} /> No downloads
+              </span>
+              <span className="flex items-center gap-1.5">
+                <Check className="h-4 w-4 text-green-600" strokeWidth={3} /> Works on any WiFi
+              </span>
             </div>
 
             {/* Features */}
@@ -441,12 +524,60 @@ const LandingPage = () => {
             transition={{ duration: 0.5, delay: 0.2 }}
             className="hidden lg:block"
           >
-            <div className="card-brutal p-0 overflow-hidden">
-              <img
-                src="https://images.unsplash.com/photo-1686624386665-4cd01b96d0f6?w=800&q=80"
-                alt="Students connecting"
-                className="w-full h-[500px] object-cover"
-              />
+            {/* Product mock: what a live call looks like */}
+            <div className="card-brutal overflow-hidden p-0">
+              <div className="relative h-[500px] bg-gradient-to-br from-[#1c1030] via-[#2a1745] to-[#0f172a] p-5">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3 rounded-[20px] border border-white/20 bg-white/10 px-4 py-2.5 backdrop-blur-xl">
+                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary font-heading text-lg font-black text-text-primary">
+                      A
+                    </div>
+                    <div>
+                      <p className="font-heading font-bold text-white">Ananya</p>
+                      <p className="text-xs text-white/70">IIT Delhi</p>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2 rounded-full border border-white/20 bg-black/40 px-3 py-1.5 text-xs font-bold text-white backdrop-blur-xl">
+                    <span className="h-2 w-2 rounded-full bg-green-400" />
+                    Strong
+                  </div>
+                </div>
+
+                <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-center">
+                  <div className="mx-auto mb-4 flex h-24 w-24 items-center justify-center rounded-full bg-gradient-to-br from-primary to-secondary font-heading text-4xl font-black text-white shadow-brutal">
+                    A
+                  </div>
+                  <p className="font-heading text-lg font-bold text-white/90">Live video call</p>
+                </div>
+
+                <div className="absolute right-5 top-24 w-32 overflow-hidden rounded-[18px] border-2 border-white/30 bg-black/60 shadow-brutal">
+                  <div className="flex aspect-video items-center justify-center bg-gradient-to-br from-secondary/40 to-primary/40">
+                    <span className="font-heading text-2xl font-black text-white">You</span>
+                  </div>
+                </div>
+
+                <div className="absolute bottom-24 left-5 max-w-[240px] rounded-[18px] rounded-bl-none border border-white/20 bg-white/90 px-4 py-3 text-sm font-medium shadow-brutal">
+                  same! which hostel are you in? 😄
+                </div>
+
+                <div className="absolute inset-x-5 bottom-5 flex items-center justify-center gap-3">
+                  {[
+                    { icon: Mic, bg: 'bg-white/15 text-white' },
+                    { icon: Video, bg: 'bg-white/15 text-white' },
+                    { icon: ScreenShare, bg: 'bg-white/15 text-white' },
+                    { icon: MessageSquare, bg: 'bg-white/15 text-white' },
+                    { icon: SkipForward, bg: 'bg-secondary text-white' },
+                    { icon: PhoneOff, bg: 'bg-red-500 text-white' },
+                  ].map((control, index) => (
+                    <div
+                      key={index}
+                      className={`flex h-11 w-11 items-center justify-center rounded-[14px] border border-white/25 backdrop-blur-xl ${control.bg}`}
+                    >
+                      <control.icon className="h-5 w-5" strokeWidth={2.5} />
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
           </motion.div>
         </div>
@@ -1153,7 +1284,7 @@ const Dashboard = () => {
   return (
     <div className="min-h-screen bg-background">
       {/* Header */}
-      <header className="bg-surface border-b-2 border-border px-4 py-4 sm:px-6">
+      <header className="sticky top-0 z-40 border-b-2 border-border bg-surface/85 px-4 py-4 backdrop-blur-xl sm:px-6">
         <div className="max-w-7xl mx-auto flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
           <h1 className="font-heading text-xl font-black sm:text-2xl">CampusLink</h1>
 
@@ -1250,6 +1381,134 @@ const Dashboard = () => {
           {activeTab === 'profile' && <ProfileTab key="profile" />}
         </AnimatePresence>
       </div>
+    </div>
+  );
+};
+
+// Network Test — verifies STUN + TURN from this exact device/network and
+// cross-checks TURN credentials from the backend's network.
+const NetworkTestCard = () => {
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState(null);
+  const [testError, setTestError] = useState('');
+
+  const runTest = async () => {
+    setTesting(true);
+    setResult(null);
+    setTestError('');
+    try {
+      const config = await getRtcConfig();
+      const serverCheckPromise = axios
+        .get('/api/turn-check')
+        .then((response) => response.data)
+        .catch(() => null);
+      const directTypes = await gatherIceCandidateTypes(config.ice_servers, 'all');
+      const relayTypes = config.turn_enabled
+        ? await gatherIceCandidateTypes(config.ice_servers, 'relay')
+        : new Set();
+      const serverCheck = await serverCheckPromise;
+      setResult({
+        stun: directTypes.has('srflx') || directTypes.has('prflx'),
+        turn: relayTypes.has('relay'),
+        turnEnabled: Boolean(config.turn_enabled),
+        serverTurn: serverCheck ? Boolean(serverCheck.turn_working) : null,
+      });
+    } catch (error) {
+      setTestError(getErrorMessage(error, 'Could not run the network test.'));
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const rows = result
+    ? [
+        {
+          label: 'Direct path (STUN)',
+          ok: result.stun,
+          okText: 'Your device can discover its public route.',
+          failText: 'Direct discovery blocked — calls will use the relay.',
+        },
+        {
+          label: 'Relay path (TURN) from this device',
+          ok: result.turnEnabled ? result.turn : null,
+          okText: 'Relay reachable — calls connect even on strict hostel/campus WiFi.',
+          failText: result.turnEnabled
+            ? 'Relay unreachable from this network. Calls may fail on strict firewalls.'
+            : 'TURN is not configured on the server.',
+        },
+        {
+          label: 'TURN credentials (checked by server)',
+          ok: result.serverTurn,
+          okText: 'Server confirmed a real relay allocation with your credentials.',
+          failText: result.serverTurn === null
+            ? 'Server check unavailable.'
+            : 'Server could not allocate a relay — check TURN credentials/quota.',
+        },
+      ]
+    : [];
+
+  const verdictOk = result && (result.turn || result.serverTurn) && result.stun !== false;
+
+  return (
+    <div className="card-brutal mt-8">
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="flex items-center gap-3">
+            <Activity className="h-7 w-7 text-secondary" strokeWidth={2.5} />
+            <h3 className="font-heading text-xl font-bold">Connection Test</h3>
+          </div>
+          <p className="mt-1 text-sm text-text-secondary">
+            10-second check that video calls will work from this network — including through strict campus firewalls.
+          </p>
+        </div>
+        <button
+          data-testid="network-test-btn"
+          onClick={runTest}
+          disabled={testing}
+          className="btn-brutal bg-surface w-full sm:w-auto"
+        >
+          {testing ? (
+            <span className="flex items-center gap-2">
+              <Loader2 className="h-5 w-5 animate-spin" /> Testing...
+            </span>
+          ) : (
+            'Test my connection'
+          )}
+        </button>
+      </div>
+
+      {testError && (
+        <div className="mt-4 border-2 border-red-500 bg-red-100 px-4 py-3 text-sm text-red-700">
+          {testError}
+        </div>
+      )}
+
+      {result && (
+        <div className="mt-5 space-y-3">
+          <div
+            className={`border-2 border-border px-4 py-3 font-bold shadow-brutal ${
+              verdictOk ? 'bg-accent-mint' : 'bg-accent-yellow'
+            }`}
+          >
+            {verdictOk
+              ? 'You are ready to call from this network.'
+              : 'Some paths are limited on this network — see details below.'}
+          </div>
+          {rows.map((row) => (
+            <div key={row.label} className="flex items-start gap-3 border-2 border-border bg-background px-4 py-3">
+              {row.ok ? (
+                <Check className="mt-0.5 h-5 w-5 shrink-0 text-green-600" strokeWidth={3} />
+              ) : (
+                <X className="mt-0.5 h-5 w-5 shrink-0 text-red-500" strokeWidth={3} />
+              )}
+              <div>
+                <p className="text-sm font-bold">{row.label}</p>
+                <p className="text-sm text-text-secondary">{row.ok ? row.okText : row.failText}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 };
@@ -1517,6 +1776,8 @@ const ConnectTab = () => {
               </button>
             </div>
           </div>
+
+          <NetworkTestCard />
         </>
       )}
     </motion.div>
