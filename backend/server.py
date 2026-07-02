@@ -128,7 +128,15 @@ TURN_CREDENTIAL = os.environ.get("TURN_CREDENTIAL")
 # Easiest TURN setup: set METERED_APP_NAME (the <app> in <app>.metered.live)
 # and METERED_API_KEY, and the backend fetches always-valid TURN credentials
 # from Metered's API — no manual TURN_USERNAME/TURN_CREDENTIAL copying.
-METERED_APP_NAME = strip_wrapping_quotes(os.environ.get("METERED_APP_NAME", "")).strip()
+def normalize_metered_app_name(raw_value: str) -> str:
+    """Accept 'myapp', 'myapp.metered.live', or a full URL — keep just 'myapp'."""
+    cleaned = strip_wrapping_quotes(raw_value).strip().lower()
+    cleaned = re.sub(r"^https?://", "", cleaned)
+    cleaned = cleaned.split(".metered.live")[0]
+    return cleaned.strip("/ .")
+
+
+METERED_APP_NAME = normalize_metered_app_name(os.environ.get("METERED_APP_NAME", ""))
 METERED_API_KEY = strip_wrapping_quotes(os.environ.get("METERED_API_KEY", "")).strip()
 ICE_CACHE_TTL_SECONDS = int(os.environ.get("ICE_CACHE_TTL_SECONDS", "3600"))
 DAILY_API_KEY = os.environ.get("DAILY_API_KEY")
@@ -1203,12 +1211,15 @@ def build_ice_servers() -> List[Dict[str, Any]]:
 
 
 METERED_READY = bool(METERED_APP_NAME and METERED_API_KEY)
-_metered_ice_cache: Dict[str, Any] = {"servers": None, "expires_at": 0.0}
+_metered_ice_cache: Dict[str, Any] = {"servers": None, "expires_at": 0.0, "last_error": None}
 
 
 async def fetch_metered_ice_servers() -> Optional[List[Dict[str, Any]]]:
     """Fetch fresh TURN credentials from Metered's API, cached for a while."""
     if not METERED_READY:
+        _metered_ice_cache["last_error"] = (
+            "METERED_APP_NAME and/or METERED_API_KEY are not set in the environment."
+        )
         return None
 
     now = time.monotonic()
@@ -1226,9 +1237,17 @@ async def fetch_metered_ice_servers() -> Optional[List[Dict[str, Any]]]:
             if isinstance(servers, list) and servers:
                 _metered_ice_cache["servers"] = servers
                 _metered_ice_cache["expires_at"] = now + ICE_CACHE_TTL_SECONDS
+                _metered_ice_cache["last_error"] = None
                 return servers
-        logger.warning("Metered credential fetch failed: HTTP %s %s", response.status_code, response.text[:200])
+            _metered_ice_cache["last_error"] = f"Metered returned an unexpected payload: {str(servers)[:120]}"
+        else:
+            _metered_ice_cache["last_error"] = (
+                f"Metered API answered HTTP {response.status_code} for app "
+                f"'{METERED_APP_NAME}': {response.text[:160]}"
+            )
+        logger.warning("Metered credential fetch failed: %s", _metered_ice_cache["last_error"])
     except Exception as exc:
+        _metered_ice_cache["last_error"] = f"Metered API unreachable: {type(exc).__name__}: {exc}"
         logger.warning("Metered credential fetch error: %s", exc)
 
     _metered_ice_cache["servers"] = None
@@ -1244,11 +1263,13 @@ async def resolve_ice_configuration() -> Dict[str, Any]:
             "ice_servers": metered_servers,
             "turn_enabled": True,
             "credentials_source": "metered_api",
+            "metered_error": None,
         }
     return {
         "ice_servers": build_ice_servers(),
         "turn_enabled": TURN_ENABLED,
         "credentials_source": "static_env",
+        "metered_error": _metered_ice_cache.get("last_error"),
     }
 
 # ---- STUN/TURN health probes (minimal RFC 5389 / RFC 5766 client) ----
@@ -3121,8 +3142,9 @@ async def turn_check(request: Request):
     turn_results = [result for result in results if result["kind"] == "turn"]
     stun_results = [result for result in results if result["kind"] == "stun"]
     return {
-        "checker_version": 3,
+        "checker_version": 4,
         "credentials_source": ice_configuration["credentials_source"],
+        "metered_error": ice_configuration.get("metered_error"),
         "turn_enabled": ice_configuration["turn_enabled"],
         "turn_working": any(result["ok"] for result in turn_results) if turn_results else False,
         "stun_working": any(result["ok"] for result in stun_results) if stun_results else False,
