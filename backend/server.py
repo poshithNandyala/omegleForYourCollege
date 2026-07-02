@@ -3046,6 +3046,7 @@ async def turn_check(request: Request):
     turn_results = [result for result in results if result["kind"] == "turn"]
     stun_results = [result for result in results if result["kind"] == "stun"]
     return {
+        "checker_version": 2,
         "turn_enabled": TURN_ENABLED,
         "turn_working": any(result["ok"] for result in turn_results) if turn_results else False,
         "stun_working": any(result["ok"] for result in stun_results) if stun_results else False,
