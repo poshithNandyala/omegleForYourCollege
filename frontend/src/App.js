@@ -1401,17 +1401,22 @@ const NetworkTestCard = () => {
       const serverCheckPromise = axios
         .get('/api/turn-check')
         .then((response) => response.data)
-        .catch(() => null);
+        .catch((error) => ({ error: getErrorMessage(error, 'Server check unavailable.') }));
       const directTypes = await gatherIceCandidateTypes(config.ice_servers, 'all');
       const relayTypes = config.turn_enabled
         ? await gatherIceCandidateTypes(config.ice_servers, 'relay')
         : new Set();
       const serverCheck = await serverCheckPromise;
+      const serverOk = serverCheck && !serverCheck.error;
       setResult({
         stun: directTypes.has('srflx') || directTypes.has('prflx'),
         turn: relayTypes.has('relay'),
         turnEnabled: Boolean(config.turn_enabled),
-        serverTurn: serverCheck ? Boolean(serverCheck.turn_working) : null,
+        serverTurn: serverOk ? Boolean(serverCheck.turn_working) : null,
+        serverError: serverCheck?.error || null,
+        checkerVersion: serverOk ? serverCheck.checker_version : null,
+        credentialsSource: (serverOk && serverCheck.credentials_source) || config.credentials_source || null,
+        serverResults: serverOk && Array.isArray(serverCheck.results) ? serverCheck.results : null,
       });
     } catch (error) {
       setTestError(getErrorMessage(error, 'Could not run the network test.'));
@@ -1441,11 +1446,18 @@ const NetworkTestCard = () => {
           ok: result.serverTurn,
           okText: 'Server confirmed a real relay allocation with your credentials.',
           failText: result.serverTurn === null
-            ? 'Server check unavailable.'
+            ? result.serverError || 'Server check unavailable.'
             : 'Server could not allocate a relay — check TURN credentials/quota.',
         },
       ]
     : [];
+
+  const credentialsSourceLabel =
+    result?.credentialsSource === 'metered_api'
+      ? 'Metered API (auto-fetched, always valid)'
+      : result?.credentialsSource === 'static_env'
+        ? 'static environment variables'
+        : null;
 
   const verdictOk = result && (result.turn || result.serverTurn) && result.stun !== false;
 
@@ -1507,6 +1519,31 @@ const NetworkTestCard = () => {
               </div>
             </div>
           ))}
+
+          {(credentialsSourceLabel || result.serverResults) && (
+            <div className="border-2 border-border bg-white/70 px-4 py-3">
+              <p className="mb-2 text-xs font-bold uppercase tracking-widest text-text-secondary">
+                {result.checkerVersion ? `Server checker v${result.checkerVersion}` : 'Server checker'}
+                {credentialsSourceLabel ? ` · credentials: ${credentialsSourceLabel}` : ''}
+              </p>
+              {result.credentialsSource === 'static_env' && (
+                <p className="mb-2 text-xs font-bold text-red-600">
+                  Metered API credentials are NOT active — the server fell back to static env vars.
+                  Check METERED_APP_NAME and METERED_API_KEY.
+                </p>
+              )}
+              {result.serverResults?.map((serverResult) => (
+                <p key={serverResult.url} className="break-all text-xs text-text-secondary">
+                  <span className={serverResult.ok ? 'font-bold text-green-600' : 'font-bold text-red-500'}>
+                    {serverResult.ok ? '✓' : '✗'}
+                  </span>{' '}
+                  {serverResult.url} — {serverResult.detail}
+                  {serverResult.hint ? ` (${serverResult.hint})` : ''}
+                  {typeof serverResult.rtt_ms === 'number' ? ` · ${serverResult.rtt_ms}ms` : ''}
+                </p>
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
