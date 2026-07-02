@@ -1282,60 +1282,64 @@ class _StunUdpProtocol(asyncio.DatagramProtocol):
         self.responses.put_nowait(data)
 
 
-async def _stun_exchange(
-    host: str,
-    port: int,
-    transport: str,
-    requests: List[bytes],
-    timeout: float = 5.0,
-) -> List[bytes]:
-    """Send STUN requests sequentially over one connection, returning responses."""
-    responses: List[bytes] = []
+async def _open_stun_session(host: str, port: int, transport: str, timeout: float = 5.0):
+    """Open one STUN/TURN transport session.
 
+    Returns (request, close) where request() sends a message and awaits the
+    response on the SAME connection — required because TURN servers bind the
+    auth nonce to the connection that received the challenge.
+    """
     if transport == "udp":
         loop = asyncio.get_running_loop()
         udp_transport, protocol = await loop.create_datagram_endpoint(
             _StunUdpProtocol, remote_addr=(host, port)
         )
-        try:
-            for request in requests:
-                udp_transport.sendto(request)
-                responses.append(await asyncio.wait_for(protocol.responses.get(), timeout))
-        finally:
+
+        async def request(data: bytes) -> bytes:
+            udp_transport.sendto(data)
+            return await asyncio.wait_for(protocol.responses.get(), timeout)
+
+        async def close() -> None:
             udp_transport.close()
-        return responses
+
+        return request, close
 
     ssl_context = ssl.create_default_context() if transport == "tls" else None
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(host, port, ssl=ssl_context), timeout
     )
-    try:
-        for request in requests:
-            writer.write(request)
-            await writer.drain()
-            header = await asyncio.wait_for(reader.readexactly(20), timeout)
-            (magic_cookie,) = struct.unpack_from("!I", header, 4)
-            (body_length,) = struct.unpack_from("!H", header, 2)
-            if magic_cookie != STUN_MAGIC_COOKIE or body_length > 4096:
-                raise ValueError("endpoint did not answer with STUN (wrong port or intercepted)")
-            body = await asyncio.wait_for(reader.readexactly(body_length), timeout)
-            responses.append(header + body)
-    finally:
+
+    async def request(data: bytes) -> bytes:
+        writer.write(data)
+        await writer.drain()
+        header = await asyncio.wait_for(reader.readexactly(20), timeout)
+        (magic_cookie,) = struct.unpack_from("!I", header, 4)
+        (body_length,) = struct.unpack_from("!H", header, 2)
+        if magic_cookie != STUN_MAGIC_COOKIE or body_length > 4096:
+            raise ValueError("endpoint did not answer with STUN (wrong port or intercepted)")
+        body = await asyncio.wait_for(reader.readexactly(body_length), timeout)
+        return header + body
+
+    async def close() -> None:
         writer.close()
         try:
             await writer.wait_closed()
         except Exception:
             pass
-    return responses
+
+    return request, close
 
 
 async def check_stun_url(url: str) -> Dict[str, Any]:
     target = _parse_ice_server_url(url)
     started = time.monotonic()
     try:
-        request = _stun_message(STUN_BINDING_REQUEST, os.urandom(12), b"")
-        responses = await _stun_exchange(target["host"], target["port"], "udp", [request])
-        message_type = struct.unpack_from("!H", responses[0], 0)[0]
+        request, close = await _open_stun_session(target["host"], target["port"], "udp")
+        try:
+            response = await request(_stun_message(STUN_BINDING_REQUEST, os.urandom(12), b""))
+        finally:
+            await close()
+        message_type = struct.unpack_from("!H", response, 0)[0]
         ok = message_type == STUN_BINDING_SUCCESS
         return {
             "url": url,
@@ -1354,79 +1358,99 @@ async def check_stun_url(url: str) -> Dict[str, Any]:
         }
 
 
+TURN_REFRESH_REQUEST = 0x0004
+STUN_ATTR_LIFETIME = 0x000D
+
+TURN_ERROR_HINTS = {
+    "401": "credentials rejected — re-copy username/credential from your TURN provider dashboard",
+    "486": "allocation quota reached — upgrade the TURN plan",
+    "438": "stale nonce — transient, retry",
+    "508": "relay capacity exhausted on the server",
+}
+
+
+def _turn_error_hint(detail: str) -> Optional[str]:
+    code = detail.split(" ")[0]
+    return TURN_ERROR_HINTS.get(code)
+
+
 async def check_turn_url(url: str, username: str, credential: str) -> Dict[str, Any]:
     target = _parse_ice_server_url(url)
     started = time.monotonic()
     requested_transport = _stun_attr(STUN_ATTR_REQUESTED_TRANSPORT, struct.pack("!B3x", 17))
+
+    def result(ok: bool, detail: str, with_rtt: bool = True) -> Dict[str, Any]:
+        payload = {
+            "url": url,
+            "kind": "turn",
+            "ok": ok,
+            "rtt_ms": round((time.monotonic() - started) * 1000) if with_rtt else None,
+            "detail": detail,
+        }
+        hint = None if ok else _turn_error_hint(detail.rsplit(": ", 1)[-1])
+        if hint:
+            payload["hint"] = hint
+        return payload
+
     try:
-        first_request = _stun_message(TURN_ALLOCATE_REQUEST, os.urandom(12), requested_transport)
-        first_response = (
-            await _stun_exchange(target["host"], target["port"], target["transport"], [first_request])
-        )[0]
-        first_type = struct.unpack_from("!H", first_response, 0)[0]
-        first_attributes = _parse_stun_attributes(first_response[20:])
+        # The whole challenge/response handshake must run on ONE connection:
+        # TURN servers bind the nonce they issue to that connection.
+        request, close = await _open_stun_session(target["host"], target["port"], target["transport"])
+        try:
+            first_response = await request(
+                _stun_message(TURN_ALLOCATE_REQUEST, os.urandom(12), requested_transport)
+            )
+            first_type = struct.unpack_from("!H", first_response, 0)[0]
+            first_attributes = _parse_stun_attributes(first_response[20:])
 
-        if first_type == TURN_ALLOCATE_SUCCESS:
-            return {
-                "url": url,
-                "kind": "turn",
-                "ok": True,
-                "rtt_ms": round((time.monotonic() - started) * 1000),
-                "detail": "relay allocation granted without auth challenge",
-            }
+            if first_type == TURN_ALLOCATE_SUCCESS:
+                return result(True, "relay allocation granted without auth challenge")
 
-        realm = first_attributes.get(STUN_ATTR_REALM)
-        nonce = first_attributes.get(STUN_ATTR_NONCE)
-        if realm is None or nonce is None:
-            return {
-                "url": url,
-                "kind": "turn",
-                "ok": False,
-                "rtt_ms": round((time.monotonic() - started) * 1000),
-                "detail": f"no auth challenge: {_stun_error_detail(first_attributes)}",
-            }
+            realm = first_attributes.get(STUN_ATTR_REALM)
+            nonce = first_attributes.get(STUN_ATTR_NONCE)
+            if realm is None or nonce is None:
+                return result(False, f"no auth challenge: {_stun_error_detail(first_attributes)}")
 
-        integrity_key = hashlib.md5(
-            b":".join([username.encode(), realm, credential.encode()])
-        ).digest()
-        authed_attributes = (
-            requested_transport
-            + _stun_attr(STUN_ATTR_USERNAME, username.encode())
-            + _stun_attr(STUN_ATTR_REALM, realm)
-            + _stun_attr(STUN_ATTR_NONCE, nonce)
-        )
-        second_request = _stun_message(
-            TURN_ALLOCATE_REQUEST, os.urandom(12), authed_attributes, integrity_key=integrity_key
-        )
-        second_response = (
-            await _stun_exchange(target["host"], target["port"], target["transport"], [second_request])
-        )[0]
-        second_type = struct.unpack_from("!H", second_response, 0)[0]
-        second_attributes = _parse_stun_attributes(second_response[20:])
+            integrity_key = hashlib.md5(
+                b":".join([username.encode(), realm, credential.encode()])
+            ).digest()
+            auth_attributes = (
+                _stun_attr(STUN_ATTR_USERNAME, username.encode())
+                + _stun_attr(STUN_ATTR_REALM, realm)
+                + _stun_attr(STUN_ATTR_NONCE, nonce)
+            )
+            second_response = await request(
+                _stun_message(
+                    TURN_ALLOCATE_REQUEST,
+                    os.urandom(12),
+                    requested_transport + auth_attributes,
+                    integrity_key=integrity_key,
+                )
+            )
+            second_type = struct.unpack_from("!H", second_response, 0)[0]
+            second_attributes = _parse_stun_attributes(second_response[20:])
 
-        if second_type == TURN_ALLOCATE_SUCCESS:
-            return {
-                "url": url,
-                "kind": "turn",
-                "ok": True,
-                "rtt_ms": round((time.monotonic() - started) * 1000),
-                "detail": "relay allocation granted (credentials valid)",
-            }
-        return {
-            "url": url,
-            "kind": "turn",
-            "ok": False,
-            "rtt_ms": round((time.monotonic() - started) * 1000),
-            "detail": f"allocation rejected: {_stun_error_detail(second_attributes)}",
-        }
+            if second_type != TURN_ALLOCATE_SUCCESS:
+                return result(False, f"allocation rejected: {_stun_error_detail(second_attributes)}")
+
+            # Release the allocation immediately (Refresh with lifetime 0) so
+            # health checks do not pile up allocations on the relay.
+            try:
+                await request(
+                    _stun_message(
+                        TURN_REFRESH_REQUEST,
+                        os.urandom(12),
+                        _stun_attr(STUN_ATTR_LIFETIME, struct.pack("!I", 0)) + auth_attributes,
+                        integrity_key=integrity_key,
+                    )
+                )
+            except Exception:
+                pass
+            return result(True, "relay allocation granted (credentials valid)")
+        finally:
+            await close()
     except Exception as exc:
-        return {
-            "url": url,
-            "kind": "turn",
-            "ok": False,
-            "rtt_ms": None,
-            "detail": f"{type(exc).__name__}: {exc}" or "unreachable",
-        }
+        return result(False, f"{type(exc).__name__}: {exc}" or "unreachable", with_rtt=False)
 
 
 # Password functions
