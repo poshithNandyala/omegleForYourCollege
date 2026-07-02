@@ -24,7 +24,7 @@ const resolveDefaultApiUrl = () => {
 };
 
 const API_URL = trimTrailingSlash(process.env.REACT_APP_BACKEND_URL || resolveDefaultApiUrl());
-const MATCH_POLL_INTERVAL_MS = 900;
+const MATCH_POLL_INTERVAL_MS = 650;
 const MATCH_WAIT_TIMEOUT_MS = 60000;
 const SOCKET_URL = API_URL.replace('https://', 'wss://').replace('http://', 'ws://');
 const DEFAULT_ICE_SERVERS = [
@@ -1904,6 +1904,14 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall, onSkip }
   }, [chatOpen, unreadMessages]);
 
   useEffect(() => {
+    if (!actionFeedback) {
+      return undefined;
+    }
+    const timerId = setTimeout(() => setActionFeedback(''), 4000);
+    return () => clearTimeout(timerId);
+  }, [actionFeedback]);
+
+  useEffect(() => {
     chatOpenRef.current = chatOpen;
   }, [chatOpen]);
 
@@ -2130,7 +2138,13 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall, onSkip }
         });
         socketRef.current.on('error', (data) => {
           debugLog('socket:error', data || {});
-          setCallError(data?.detail || 'A realtime error interrupted the call.');
+          const detail = data?.detail || '';
+          // Rate-limit nudges are not call failures — show them gently.
+          if (/too many/i.test(detail)) {
+            setActionFeedback(detail);
+            return;
+          }
+          setCallError(detail || 'A realtime error interrupted the call.');
         });
         socketRef.current.on('screen_share', (data) => {
           if (data?.from_id !== matchedUser.user_id || data?.call_id !== callId) {
@@ -2411,16 +2425,24 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall, onSkip }
         } catch (senderError) {
           debugLog('webrtc:sender-tune-error', { message: senderError?.message });
         }
-        if (canFallbackToDaily) {
-          fallbackTimeoutRef.current = window.setTimeout(() => {
-            if (!remoteVideoReadyRef.current && callProviderRef.current === 'webrtc') {
-              triggerDailyFallback('remote_video_timeout', {
-                connectionState: peerConnectionRef.current?.connectionState,
-                iceConnectionState: peerConnectionRef.current?.iceConnectionState,
-              });
-            }
-          }, 12000);
-        }
+        // Watchdog: if remote video hasn't arrived in 12s, don't sit on
+        // "Negotiating video..." — fall back to Daily when available,
+        // otherwise climb the recovery ladder (ICE restart → TURN-only).
+        fallbackTimeoutRef.current = window.setTimeout(() => {
+          if (remoteVideoReadyRef.current || callProviderRef.current !== 'webrtc') {
+            return;
+          }
+          const stuckDetails = {
+            connectionState: peerConnectionRef.current?.connectionState,
+            iceConnectionState: peerConnectionRef.current?.iceConnectionState,
+          };
+          if (canFallbackToDaily) {
+            triggerDailyFallback('remote_video_timeout', stuckDetails);
+            return;
+          }
+          debugLog('webrtc:remote-video-timeout', stuckDetails);
+          scheduleRecovery('remote_video_timeout');
+        }, 12000);
 
         peerConnectionRef.current.ontrack = (event) => {
           debugLog('webrtc:ontrack', {
@@ -2506,7 +2528,11 @@ const VideoCall = ({ matchedUser, callId, mode, isInitiator, onEndCall, onSkip }
           window.setTimeout(() => {
             const currentIceState = peerConnectionRef.current?.iceConnectionState;
             const currentState = peerConnectionRef.current?.connectionState;
-            if (currentIceState === 'failed' || currentState === 'failed') {
+            const connected =
+              currentState === 'connected' ||
+              currentIceState === 'connected' ||
+              currentIceState === 'completed';
+            if (!connected && peerConnectionRef.current) {
               void escalateConnectionRecovery(`${trigger}_waited`);
             }
           }, 5000);
